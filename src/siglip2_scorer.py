@@ -80,8 +80,15 @@ class SigLIP2Scorer:
 
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        if torch.cuda.is_available():
+            self.device = "cuda"
+            self.dtype = torch.float16
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = "mps"
+            self.dtype = torch.float16
+        else:
+            self.device = "cpu"
+            self.dtype = torch.float32
 
         model_id = cfg.siglip2_model
         try:
@@ -234,3 +241,5 @@ class SigLIP2Scorer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()

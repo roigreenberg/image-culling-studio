@@ -9,19 +9,51 @@
 *token*
 *credential*
 
-# Local Culling Outputs, User Picks & Personal Models
+# Local Culling Outputs, User Picks, Release Builds & Backups
 cull_output/
 cull_output_*/
 studio_data/
-models/
+/models/
+dist/
+.update_backup/
 my_picks.json
 embeddings.npz
 feedback_history.jsonl
+training_history.jsonl
 *.pkl
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 
 # Camera RAWs, JPEGs & XMP Sidecars
 *.CR3
 *.cr3
+*.CR2
+*.cr2
+*.NEF
+*.nef
+*.NRW
+*.nrw
+*.ARW
+*.arw
+*.SR2
+*.sr2
+*.DNG
+*.dng
+*.RAF
+*.raf
+*.ORF
+*.orf
+*.RW2
+*.rw2
+*.PEF
+*.pef
+*.SRW
+*.srw
+*.3FR
+*.3fr
 *.JPG
 *.jpg
 *.JPEG
@@ -48,3 +80,10 @@ __pycache__/
 *.pth
 *.npy
 *.npz
+*.keras
+*.json.gz
+*.download
+vendor/ProjectKestrel/analyzer/models/siglip/
+vendor/ProjectKestrel/analyzer/models/labels.txt
+vendor/ProjectKestrel/analyzer/models/labels_scispecies.csv
+vendor/ProjectKestrel/analyzer/models/scispecies_dispname.csv

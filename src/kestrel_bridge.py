@@ -15,20 +15,41 @@ from .config import PipelineConfig
 logger = logging.getLogger(__name__)
 
 
-def _init_kestrel_imports(kestrel_dir: Path):
+def _init_kestrel_imports(kestrel_dir: Path) -> Tuple[bool, str]:
+    """
+    Configure Project Kestrel ONNX Runtime provider policy for the current platform:
+      - Windows + NVIDIA CUDA -> CUDAExecutionProvider
+      - Windows + DirectML    -> DmlExecutionProvider
+      - macOS                 -> CoreMLExecutionProvider
+      - Fallback              -> CPUExecutionProvider
+    Returns (use_gpu, device_label).
+    """
     analyzer_root = str((kestrel_dir / "analyzer").resolve())
     if analyzer_root not in sys.path:
         sys.path.insert(0, analyzer_root)
 
-    # Import torch first so CUDA/cuDNN DLLs are loaded for onnxruntime-gpu
-    import torch  # noqa: F401
+    # Import torch first so CUDA/cuDNN DLLs are preloaded for onnxruntime-gpu when present
+    import torch
+    import onnxruntime as ort
     import kestrel_analyzer.ml as kml
     import kestrel_analyzer.ml.providers as kprov
 
-    # Configure Project Kestrel's provider policy to use CUDAExecutionProvider on RTX 4060
-    kml.GPU_EP = "CUDAExecutionProvider"
-    kprov.GPU_GRAPH_EPS = frozenset({"DmlExecutionProvider", "CUDAExecutionProvider"})
+    avail = set(ort.get_available_providers())
     kprov._probe_unsupported = True
+
+    if torch.cuda.is_available() and "CUDAExecutionProvider" in avail:
+        kml.GPU_EP = "CUDAExecutionProvider"
+        kprov.GPU_GRAPH_EPS = frozenset({"DmlExecutionProvider", "CUDAExecutionProvider"})
+        return True, "GPU (CUDA)"
+    if "DmlExecutionProvider" in avail:
+        kml.GPU_EP = "DmlExecutionProvider"
+        kprov.GPU_GRAPH_EPS = frozenset({"DmlExecutionProvider"})
+        return True, "GPU (DirectML)"
+    if sys.platform == "darwin" and "CoreMLExecutionProvider" in avail:
+        kml.GPU_EP = "CoreMLExecutionProvider"
+        return True, "GPU (CoreML)"
+
+    return False, "CPU"
 
 
 def compute_masked_head_sharpness(
@@ -224,7 +245,18 @@ class KestrelCoreRunner:
 
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
-        _init_kestrel_imports(cfg.kestrel_dir)
+        from setup_models import find_missing_kestrel_models
+
+        missing = find_missing_kestrel_models(cfg.kestrel_dir, cfg.kestrel_detector)
+        if missing:
+            sample = ", ".join(missing[:4]) + (f" (+{len(missing) - 4} more)" if len(missing) > 4 else "")
+            extra_flag = " --include-mdv5a" if cfg.kestrel_detector == "mdv5a" else ""
+            raise FileNotFoundError(
+                f"Missing Project Kestrel model file(s): {sample}. "
+                f"Run `python setup_models.py{extra_flag}` once to download the required AI weights."
+            )
+
+        use_gpu, device_label = _init_kestrel_imports(cfg.kestrel_dir)
 
         from kestrel_analyzer.config import (
             MODELS_DIR,
@@ -236,10 +268,10 @@ class KestrelCoreRunner:
         from kestrel_analyzer.ml.quality import QualityClassifier
         from kestrel_analyzer.ml.speciesnet_sam_hq import DetectorSAMHQWrapper
 
-        logger.info("Initializing Project Kestrel ONNX GPU pipeline (%s)...", cfg.kestrel_detector)
+        logger.info("Initializing Project Kestrel ONNX %s pipeline (%s)...", device_label, cfg.kestrel_detector)
         self.det_sam = DetectorSAMHQWrapper(
             max_bird_crops=5,
-            use_gpu=True,
+            use_gpu=use_gpu,
             detector_name=cfg.kestrel_detector,
         )
         self.det_sam.ensure_loaded()

@@ -300,11 +300,16 @@ def run_pipeline(cfg: PipelineConfig, reselect_only: bool = False) -> Dict[str, 
             raise ValueError(
                 "Source directory is required. Pass --input-dir / --source or set CULL_SOURCE_DIR in .env."
             )
-        logger.info("PyTorch: %s | CUDA: %s", torch.__version__, torch.cuda.is_available())
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA GPU is required.")
-        props = torch.cuda.get_device_properties(0)
-        logger.info("GPU: %s (%.2f GB VRAM)", props.name, props.total_memory / (1024**3))
+        has_cuda = torch.cuda.is_available()
+        has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        logger.info("PyTorch: %s | CUDA: %s | MPS: %s", torch.__version__, has_cuda, has_mps)
+        if has_cuda:
+            props = torch.cuda.get_device_properties(0)
+            logger.info("GPU: %s (%.2f GB VRAM)", props.name, props.total_memory / (1024**3))
+        elif has_mps:
+            logger.info("GPU: Apple Silicon MPS")
+        else:
+            logger.warning("No CUDA/MPS GPU detected — running on CPU (slower).")
 
         image_items = discover_images(cfg.source_dir, limit=cfg.limit)
         if not image_items:

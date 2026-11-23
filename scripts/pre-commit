@@ -11,15 +11,17 @@ from pathlib import Path
 
 BLOCKED_EXTENSIONS = {
     ".pem", ".key", ".p12",
-    ".cr3", ".nef", ".arw", ".dng", ".jpg", ".jpeg", ".xmp",
-    ".onnx", ".safetensors", ".bin", ".pt", ".pth", ".npz", ".npy", ".pkl",
+    ".cr3", ".cr2", ".nef", ".nrw", ".arw", ".sr2", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw", ".3fr",
+    ".jpg", ".jpeg", ".xmp",
+    ".onnx", ".safetensors", ".bin", ".pt", ".pth", ".npz", ".npy", ".pkl", ".data", ".keras",
+    ".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3",
 }
 
 BLOCKED_NAME_FRAGMENTS = ("secret", "token", "credential")
 
-BLOCKED_EXACT_NAMES = {".env", "my_picks.json", "embeddings.npz"}
+BLOCKED_EXACT_NAMES = {".env", "my_picks.json", "embeddings.npz", "feedback_history.jsonl", "training_history.jsonl"}
 
-BLOCKED_DIR_PREFIXES = ("cull_output/", "studio_data/", ".venv/")
+BLOCKED_DIR_PREFIXES = ("cull_output/", "studio_data/", "models/", ".venv/")
 
 SECRET_PATTERNS = [
     ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -37,7 +39,7 @@ SECRET_PATTERNS = [
 ]
 
 USER_PATH_PATTERN = re.compile(r"(C:\\Users\\|/Users/|/home/)", re.IGNORECASE)
-PATH_DOC_ALLOWLIST = {"SECURITY.md", "scripts/pre-commit"}
+PATH_DOC_ALLOWLIST = {"SECURITY.md", "scripts/pre-commit", "scripts/build_release.py"}
 
 
 def _staged_files() -> list[str]:
