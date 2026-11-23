@@ -39,8 +39,8 @@ class PipelineConfig:
 
     # Step 2A.4: Scene / Burst grouping
     burst_gap_seconds: float = 2.0
-    scene_gap_seconds: float = 12.0
-    scene_sim_threshold: float = 0.84
+    scene_gap_seconds: float = 4.0
+    scene_sim_threshold: float = 0.96
     zoom_split_ratio: float = 0.10  # >= 10% focal length change starts a new scenario
 
     # Step 2B: SigLIP 2 (GPU fp16 across 100% of images)

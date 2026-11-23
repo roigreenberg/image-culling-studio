@@ -221,6 +221,7 @@ def generate_html_report(
                 "bi": r["burst_id"],
                 "bs": r["burst_size"],
                 "br": r["burst_rank"],
+                "bx": r.get("burst_index", 1),
                 "ts": r["timestamp_str"],
                 "tm": round(float(r.get("timestamp") or 0.0), 3),
                 "fl": r.get("focal_length"),
@@ -465,6 +466,7 @@ def generate_html_report(
       <button id="modalL2Btn" class="pick-btn">&#9733; Edit (E)</button>
       <button id="modalL1Btn" class="pick-btn">&#10003; Keep (P)</button>
       <button id="modalRejectBtn" class="pick-btn">&#10007; Reject (X)</button>
+      <button id="modalSplitBtn" class="pick-btn" title="Make this image #1 of a new burst">&#9986; Split Burst (S)</button>
       <button id="modalPrevBtn">&larr; Prev</button>
       <button id="modalNextBtn">Next &rarr;</button>
       <button id="modalCloseBtn">Close (Esc)</button>
@@ -488,7 +490,11 @@ def generate_html_report(
 const ITEMS = {data_json};
 const META = {meta_json};
 const STORAGE_KEY = "kestrel_siglip2_picks_v1";
+const SPLIT_STORAGE_KEY = "kestrel_siglip2_splits_v1";
 const BATCH_SIZE = 60;
+
+// Preserve original pipeline burst IDs before applying user splits
+ITEMS.forEach(it => {{ it.base_bi = it.bi; }});
 
 let state = {{
   tab: "layer2",
@@ -499,6 +505,7 @@ let state = {{
   search: "",
   renderedCount: 0,
   picks: loadPicks(),
+  splits: loadSplits(),
   filtered: [],
   modalIndex: -1
 }};
@@ -508,9 +515,62 @@ function loadPicks() {{
   catch {{ return {{}}; }}
 }}
 
+function loadSplits() {{
+  try {{ return JSON.parse(localStorage.getItem(SPLIT_STORAGE_KEY) || "{{}}"); }}
+  catch {{ return {{}}; }}
+}}
+
 function savePicks() {{
   try {{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state.picks)); }} catch {{}}
   updatePicksStatus();
+}}
+
+function saveSplits() {{
+  try {{ localStorage.setItem(SPLIT_STORAGE_KEY, JSON.stringify(state.splits)); }} catch {{}}
+}}
+
+function recomputeBurstsFromSplits() {{
+  // Group chronologically by (subfolder, timestamp, filename) and split whenever state.splits[id] is true
+  const chrono = [...ITEMS].sort((a, b) => a.sf.localeCompare(b.sf) || (a.tm - b.tm) || a.fn.localeCompare(b.fn));
+  let counter = 0;
+  let prev = null;
+  const groups = new Map();
+  for (const it of chrono) {{
+    let isNew = false;
+    if (!prev || prev.sf !== it.sf || prev.base_bi !== it.base_bi || state.splits[it.id]) {{
+      isNew = true;
+    }}
+    if (isNew) counter++;
+    const newId = `S${{String(counter).padStart(4, "0")}}`;
+    it.bi = newId;
+    if (!groups.has(newId)) groups.set(newId, []);
+    groups.get(newId).push(it);
+    prev = it;
+  }}
+  for (const members of groups.values()) {{
+    const bsize = members.length;
+    members.forEach((m, idx) => {{
+      m.bs = bsize;
+      m.bx = idx + 1;
+    }});
+  }}
+}}
+
+function toggleSplitBurst(id) {{
+  if (state.splits[id]) {{
+    delete state.splits[id];
+    showToast("Merged burst split back.");
+  }} else {{
+    state.splits[id] = true;
+    showToast("Split burst here — this image is now #1 of its burst!");
+  }}
+  saveSplits();
+  recomputeBurstsFromSplits();
+  applyFilterAndRender();
+  if (state.modalIndex >= 0 && document.getElementById("lightboxModal").classList.contains("open")) {{
+    const cur = state.filtered.findIndex(x => x.id === id);
+    if (cur >= 0) openModal(cur);
+  }}
 }}
 
 function showToast(msg) {{
@@ -572,6 +632,11 @@ function init() {{
   document.getElementById("modalL2Btn").addEventListener("click", () => toggleModalPick("layer2_edit"));
   document.getElementById("modalL1Btn").addEventListener("click", () => toggleModalPick("layer1_keep"));
   document.getElementById("modalRejectBtn").addEventListener("click", () => toggleModalPick("reject"));
+  document.getElementById("modalSplitBtn").addEventListener("click", () => {{
+    if (state.modalIndex >= 0 && state.modalIndex < state.filtered.length) {{
+      toggleSplitBurst(state.filtered[state.modalIndex].id);
+    }}
+  }});
 
   document.addEventListener("keydown", e => {{
     const modal = document.getElementById("lightboxModal");
@@ -582,6 +647,7 @@ function init() {{
     else if (e.key.toLowerCase() === "e") toggleModalPick("layer2_edit");
     else if (e.key.toLowerCase() === "p") toggleModalPick("layer1_keep");
     else if (e.key.toLowerCase() === "x") toggleModalPick("reject");
+    else if (e.key.toLowerCase() === "s") toggleSplitBurst(state.filtered[state.modalIndex].id);
   }});
 
   const sentinel = document.getElementById("scrollSentinel");
@@ -594,6 +660,7 @@ function init() {{
     observer.observe(sentinel);
   }}
 
+  recomputeBurstsFromSplits();
   updatePicksStatus();
   applyFilterAndRender();
 }}
@@ -747,7 +814,7 @@ function appendNextBatch() {{
             ${{speciesTag}}
             ${{hybridTag}}
             <span class="tag">${{it.sf}}</span>
-            <span class="tag">${{it.bi}} (${{it.br}}/${{it.bs}})</span>
+            <span class="tag">${{it.bi}} (${{it.bx}}/${{it.bs}})</span>
           </div>
         </div>
         <div class="scores-row">
@@ -759,6 +826,7 @@ function appendNextBatch() {{
         <div class="card-footer">
           <div class="exif-line" title="${{it.ts}}">${{exifText}} · ${{it.ts}}</div>
           <div class="pick-btns">
+            ${{(it.bs > 1 && it.bx > 1) || state.splits[it.id] ? `<button class="pick-btn split-btn" data-split="${{it.id}}" title="Make this image #1 of a new burst">${{state.splits[it.id] ? "&#8634; Unsplit" : "&#9986; Split"}}</button>` : ""}}
             <button class="pick-btn ${{pick === "layer2_edit" ? "active-l2" : ""}}" data-action="layer2_edit" data-id="${{it.id}}">&#9733; Edit</button>
             <button class="pick-btn ${{pick === "layer1_keep" ? "active-l1" : ""}}" data-action="layer1_keep" data-id="${{it.id}}">&#10003; Keep</button>
             <button class="pick-btn ${{pick === "reject" ? "active-reject" : ""}}" data-action="reject" data-id="${{it.id}}">&#10007; Reject</button>
@@ -770,7 +838,7 @@ function appendNextBatch() {{
     card.querySelectorAll(".img-slot").forEach(slot => {{
       slot.addEventListener("click", () => openModal(globalFilteredIdx));
     }});
-    card.querySelectorAll(".pick-btn").forEach(btn => {{
+    card.querySelectorAll(".pick-btn[data-action]").forEach(btn => {{
       btn.addEventListener("click", () => {{
         const id = btn.dataset.id;
         const act = btn.dataset.action;
@@ -780,6 +848,10 @@ function appendNextBatch() {{
         refreshCardPickState(id);
       }});
     }});
+    const splitBtn = card.querySelector(".split-btn");
+    if (splitBtn) {{
+      splitBtn.addEventListener("click", () => toggleSplitBurst(splitBtn.dataset.split));
+    }}
 
     frag.appendChild(card);
   }});
@@ -865,6 +937,7 @@ async function copyLightroomFilter(mode) {{
 function exportMyPicks() {{
   const payload = {{
     exported_at: new Date().toISOString(),
+    burst_splits: Object.keys(state.splits),
     picks: ITEMS.filter(it => state.picks[it.id]).map(it => ({{
       image_id: it.id,
       filename: it.fn,
