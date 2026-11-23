@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Git pre-commit hook: blocks secrets, private media, model weights, and hardcoded user paths."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BLOCKED_EXTENSIONS = {
+    ".pem", ".key", ".p12",
+    ".cr3", ".nef", ".arw", ".dng", ".jpg", ".jpeg", ".xmp",
+    ".onnx", ".safetensors", ".bin", ".pt", ".pth", ".npz", ".npy", ".pkl",
+}
+
+BLOCKED_NAME_FRAGMENTS = ("secret", "token", "credential")
+
+BLOCKED_EXACT_NAMES = {".env", "my_picks.json", "embeddings.npz"}
+
+BLOCKED_DIR_PREFIXES = ("cull_output/", "studio_data/", ".venv/")
+
+SECRET_PATTERNS = [
+    ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("Hugging Face Token", re.compile(r"hf_[A-Za-z0-9]{20,}")),
+    ("GitHub Token", re.compile(r"gh[po]_[A-Za-z0-9]{20,}")),
+    ("OpenAI/API Secret Key", re.compile(r"sk-[A-Za-z0-9\-_]{20,}")),
+    ("Bearer Token", re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]{12,}=*")),
+    ("Private Key Header", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    (
+        "Credential Assignment",
+        re.compile(
+            r"(?i)\b(API_KEY|SECRET|TOKEN|PASSWORD)\b\s*[:=]\s*[\"'][^\"'\s]{6,}[\"']"
+        ),
+    ),
+]
+
+USER_PATH_PATTERN = re.compile(r"(C:\\Users\\|/Users/|/home/)", re.IGNORECASE)
+PATH_DOC_ALLOWLIST = {"SECURITY.md", "scripts/pre-commit"}
+
+
+def _staged_files() -> list[str]:
+    out = subprocess.check_output(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"],
+    )
+    return [p for p in out.decode("utf-8", errors="replace").split("\x00") if p]
+
+
+def _staged_bytes(path: str) -> bytes:
+    return subprocess.check_output(["git", "show", f":{path}"])
+
+
+def main() -> int:
+    violations: list[str] = []
+    files = _staged_files()
+
+    for rel_path in files:
+        norm = rel_path.replace("\\", "/")
+        lower = norm.lower()
+        name = Path(norm).name.lower()
+        suffix = Path(norm).suffix.lower()
+
+        if name in BLOCKED_EXACT_NAMES or name.startswith(".env.") and name != ".env.example":
+            violations.append(f"[BLOCKED FILE] {norm}")
+            continue
+        if any(norm.startswith(prefix) for prefix in BLOCKED_DIR_PREFIXES):
+            violations.append(f"[BLOCKED DIR]  {norm}")
+            continue
+        if suffix in BLOCKED_EXTENSIONS:
+            violations.append(f"[BLOCKED EXT]  {norm}")
+            continue
+        if any(frag in name for frag in BLOCKED_NAME_FRAGMENTS) and name not in {"security.md", "pre-commit"}:
+            violations.append(f"[BLOCKED NAME] {norm}")
+            continue
+
+        try:
+            raw = _staged_bytes(rel_path)
+        except subprocess.CalledProcessError:
+            continue
+
+        if b"\x00" in raw[:4096]:
+            continue  # Skip binary check
+
+        text = raw.decode("utf-8", errors="ignore")
+        for label, pat in SECRET_PATTERNS:
+            if pat.search(text):
+                violations.append(f"[SECRET: {label}] {norm}")
+
+        if norm not in PATH_DOC_ALLOWLIST and USER_PATH_PATTERN.search(text):
+            violations.append(f"[USER PATH]    {norm}")
+
+    if violations:
+        sys.stderr.write("\nPRE-COMMIT BLOCKED: Sensitive file, secret, or personal path detected:\n")
+        for v in violations:
+            sys.stderr.write(f"  - {v}\n")
+        sys.stderr.write("\nUnstage or remove the offending content before committing.\n")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

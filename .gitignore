@@ -1,0 +1,50 @@
+# Environments & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*secret*
+*token*
+*credential*
+
+# Local Culling Outputs, User Picks & Personal Models
+cull_output/
+cull_output_*/
+studio_data/
+models/
+my_picks.json
+embeddings.npz
+feedback_history.jsonl
+*.pkl
+
+# Camera RAWs, JPEGs & XMP Sidecars
+*.CR3
+*.cr3
+*.JPG
+*.jpg
+*.JPEG
+*.jpeg
+*.xmp
+*.XMP
+
+# Python Virtualenv & Caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Downloaded Model Weights & Binary Blobs
+*.onnx
+*.onnx.data
+*.data
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.npy
+*.npz
