@@ -1,0 +1,56 @@
+__pycache__
+test_imgs/.kestrel/
+# Every local virtualenv, however it is named. The specific entries below
+# predate this and are now redundant, but harmless -- they are kept so a grep
+# for a particular venv name still finds something. .venv312/ (the documented
+# Windows dev env) was missed by the one-at-a-time list and sat untracked but
+# NOT ignored, one `git add -A` away from committing a multi-GB tree.
+.venv*/
+.venv/
+.venv-speciesnet/
+.venv2/
+large_files/
+.venv_from_base/
+dist/
+release/
+.venv-macos/
+analyzer/build/
+analyzer/dist/
+# Build artifact written by the PyInstaller specs (baked distribution channel).
+analyzer/dist_channel.txt
+cloudflare-workers/
+cloudflare-workers_secret/
+query_analytics/
+query_analytics_out/
+_test_imgs_secret/
+BUGFIX_FOLDER_TREE_LIVE_UPDATES.md
+_test_imgs_secret*/
+analyzer/models/base_epoch_16.keras
+analyzer/models/fullfull_ep3.keras
+analyzer/models/old_quality.keras
+analyzer/models/quality_fullfull_1.keras
+analyzer/models/quality_test1.keras
+analyzer/models/quality_set1_ep5.keras
+analyzer/models/quality_set4_ep4.keras
+analyzer/models/quality_set4_ep6.keras
+analyzer/models/quality_set6_ep1.keras
+analyzer/models/current.md
+analyzer/models/sam_hq_vit_b.pth
+analyzer/models/sam_hq_vit_tiny.pth
+tmp_onefile_probe.py
+tmp_compare_legacy_vs_proposed_demosets_detailed_summary.json
+tmp_compare_legacy_vs_proposed_demosets_detailed.py
+tmp_compare_legacy_vs_proposed_demosets_summary.json
+tmp_compare_legacy_vs_proposed_demosets.py
+tmp_exposure_solver_benchmark_report_reimagined.json
+tmp_exposure_solver_benchmark_report.json
+tmp_exposure_solver_benchmark_rounds.py
+tmp*
+.venv-speciesnet/
+test_imgs/.kestrel*
+documentation/
+.claude*
+EXPCOMP_tests/
+_kestrel*
+.tmp*
+.wrangler/

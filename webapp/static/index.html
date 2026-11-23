@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ImageCulling Studio — Fast Wildlife & Bird Culling</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- TOP BAR -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand">
+          <span class="brand-icon">🦅</span>
+          <span class="brand-title">ImageCulling Studio</span>
+        </div>
+        <button id="btnOpenDir" class="btn btn-primary btn-sm" title="Open a photo directory">
+          📂 Open Folder
+        </button>
+        <div class="cull-menu-wrap">
+          <button id="btnRunCullMenu" class="btn btn-accent btn-sm">⚡ Run AI Cull ▾</button>
+          <div id="cullDropdown" class="dropdown hidden">
+            <button class="dropdown-item" data-cull-mode="unculled">
+              <strong>Run Unculled Only</strong>
+              <span>Process only new / unculled images</span>
+            </button>
+            <button class="dropdown-item" data-cull-mode="selected">
+              <strong>Run Selected (<span id="ddSelCount">0</span>)</strong>
+              <span>Re-score only checked images</span>
+            </button>
+            <button class="dropdown-item" data-cull-mode="full">
+              <strong>Run Full Folder</strong>
+              <span>Re-run AI pipeline on entire active folder</span>
+            </button>
+            <div class="dropdown-sep"></div>
+            <button class="dropdown-item" id="btnFastReselect">
+              <strong>🔁 Fast Reselect (~2s)</strong>
+              <span>Re-run scenario grouping &amp; Personal Ranker on cached embeddings</span>
+            </button>
+            <button class="dropdown-item" id="btnSyncResultsJson">
+              <strong>📥 Import / Sync results.json</strong>
+              <span>Reload latest Project Kestrel CLI results &amp; embeddings.npz</span>
+            </button>
+            <div class="dropdown-sep"></div>
+            <button class="dropdown-item" id="btnGenHqJpgs">
+              <strong>🖼️ Pre-Convert Fast HQ JPGs</strong>
+              <span>Convert RAWs to crisp 1600px JPGs for instant review</span>
+            </button>
+            <button class="dropdown-item" id="btnScanMeta">
+              <strong>🔄 Refresh EXIF, Camera Ratings &amp; XMP</strong>
+              <span>Scan folder for new files, Lens EXIF &amp; Lightroom XMPs</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- LIVE PROGRESS PILL -->
+      <div id="progressPill" class="progress-pill idle" title="Click to view Process & Live Logs">
+        <div class="progress-pill-top">
+          <span id="progressDot" class="status-dot"></span>
+          <span id="progressText" class="progress-text">Ready</span>
+          <span id="progressPct" class="progress-pct"></span>
+          <button id="btnCancelTask" class="btn-icon-xs hidden" title="Cancel running task">✕</button>
+        </div>
+        <div class="progress-bar-track">
+          <div id="progressBarFill" class="progress-bar-fill" style="width:0%"></div>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <div class="view-switcher">
+          <button class="btn-seg active" data-view="grid" title="Grid View (G)">⊞ Grid</button>
+          <button class="btn-seg" data-view="loupe" title="Loupe View (E)">▣ Loupe</button>
+          <button class="btn-seg" data-view="compare" title="Compare Burst / Selected (C)">◫ Compare</button>
+        </div>
+        <button id="btnUndo" class="btn btn-ghost btn-sm" title="Undo last rating/color/XMP change (Ctrl+Z)">↩ Undo</button>
+        <button id="btnLogs" class="btn btn-ghost btn-sm" title="Live Logs, Pipeline Runs & Change Restore">📜 Logs &amp; Restore</button>
+        <button id="btnLearning" class="btn btn-ghost btn-sm" title="AI vs User Learning Insights">🧠 Insights</button>
+        <button id="btnSettings" class="btn btn-ghost btn-sm" title="XMP Sync & Studio Settings">⚙ Settings</button>
+        <button id="btnShortcuts" class="btn btn-ghost btn-sm" title="Keyboard Shortcuts (?)">?</button>
+      </div>
+    </header>
+
+    <!-- MAIN BODY -->
+    <div class="workspace">
+      <!-- LEFT SIDEBAR -->
+      <aside class="sidebar">
+        <!-- Directory Selector -->
+        <div class="side-section">
+          <div class="side-title">Workspace Directory</div>
+          <select id="dirSelect" class="select-input"></select>
+          <div id="dirPathLabel" class="dir-path-label"></div>
+        </div>
+
+        <!-- Folders (Each Folder In Its Own) -->
+        <div class="side-section">
+          <div class="side-title">Folders</div>
+          <div id="folderList" class="folder-list"></div>
+        </div>
+
+        <!-- Culling Layers (Color-based current state by default; check 'AI' for original AI values) -->
+        <div class="side-section">
+          <div class="side-title-row">
+            <span class="side-title">Culling Layer</span>
+            <label class="checkbox-row compact" title="Check to filter by original AI culling values instead of your current color changes">
+              <input type="checkbox" id="chkUseAiLayer" />
+              <span>AI</span>
+            </label>
+          </div>
+          <div id="layerFilters" class="pill-stack">
+            <button class="filter-row active" data-layer=""><span>All Images</span><span class="badge" id="cntAll">0</span></button>
+            <button class="filter-row" data-layer="layer2_to_edit"><span class="dot dot-l2"></span><span>Layer 2 · To Edit</span><span class="badge badge-l2" id="cntL2">0</span></button>
+            <button class="filter-row" data-layer="layer1_all"><span class="dot dot-l1"></span><span>Layer 1 · Keep (All)</span><span class="badge badge-l1" id="cntL1">0</span></button>
+            <button class="filter-row" data-layer="rejected"><span class="dot dot-rej"></span><span>Not Selected</span><span class="badge" id="cntRej">0</span></button>
+            <button class="filter-row" data-layer="to_delete"><span class="dot dot-del"></span><span>To Delete (Bad/Blur)</span><span class="badge badge-del" id="cntDel">0</span></button>
+            <button class="filter-row" data-layer="unculled"><span class="dot dot-unc"></span><span>Unculled</span><span class="badge" id="cntUnc">0</span></button>
+          </div>
+        </div>
+
+        <!-- Star Rating & Color Label Filters -->
+        <div class="side-section">
+          <div class="side-title-row">
+            <span class="side-title">Rating &amp; Color (Camera / XMP)</span>
+            <div class="rating-op-group" id="ratingOpBar" title="Rating comparison: ≥ (at least), = (exact), ≤ (at most)">
+              <button class="rop-btn active" data-op="gte">≥</button>
+              <button class="rop-btn" data-op="eq">=</button>
+              <button class="rop-btn" data-op="lte">≤</button>
+            </div>
+          </div>
+          <div class="rating-filter-bar" id="ratingFilterBar">
+            <button class="rf-btn active" data-rating="">All</button>
+            <button class="rf-btn" data-rating="0" title="0 stars (unrated)">0★</button>
+            <button class="rf-btn" data-rating="1">1★</button>
+            <button class="rf-btn" data-rating="2">2★</button>
+            <button class="rf-btn" data-rating="3">3★</button>
+            <button class="rf-btn" data-rating="4">4★</button>
+            <button class="rf-btn" data-rating="5">5★</button>
+          </div>
+          <div class="color-filter-bar" id="colorFilterBar" title="Click colors to toggle multiple on/off">
+            <button class="cf-dot cf-all active" data-label="__all__" title="Show all colors">All</button>
+            <button class="cf-dot cf-none-flt" data-label="__none__" title="No color label">∅</button>
+            <button class="cf-dot cf-Red" data-label="Red" title="Toggle Red"></button>
+            <button class="cf-dot cf-Yellow" data-label="Yellow" title="Toggle Yellow"></button>
+            <button class="cf-dot cf-Green" data-label="Green" title="Toggle Green"></button>
+            <button class="cf-dot cf-Blue" data-label="Blue" title="Toggle Blue"></button>
+            <button class="cf-dot cf-Purple" data-label="Purple" title="Toggle Purple"></button>
+          </div>
+        </div>
+
+        <!-- Shutter Speed Tier Filter -->
+        <div class="side-section">
+          <div class="side-title">Shutter Speed Tier</div>
+          <div id="speedFilters" class="pill-stack">
+            <button class="filter-row active" data-speed=""><span>All Speeds</span></button>
+            <button class="filter-row" data-speed="super_fast"><span class="spd-ico spd-super_fast">⚡</span><span>Super Fast (≤ 1/1600s)</span><span class="badge" id="cntSpdSuper">0</span></button>
+            <button class="filter-row" data-speed="fast"><span class="spd-ico spd-fast">🚀</span><span>Fast (1/500–1/1600s)</span><span class="badge" id="cntSpdFast">0</span></button>
+            <button class="filter-row" data-speed="medium"><span class="spd-ico spd-medium">⏱</span><span>Medium (1/125–1/500s)</span><span class="badge" id="cntSpdMed">0</span></button>
+            <button class="filter-row" data-speed="slow"><span class="spd-ico spd-slow">🐢</span><span>Slow (&gt; 1/125s)</span><span class="badge" id="cntSpdSlow">0</span></button>
+          </div>
+        </div>
+
+        <!-- Project Kestrel: Track, Species & Scenario -->
+        <div class="side-section">
+          <div class="side-title">Kestrel Track &amp; Species</div>
+          <div id="trackFilters" class="rating-filter-bar">
+            <button class="rf-btn active" data-track="">All</button>
+            <button class="rf-btn" data-track="Wildlife" title="Wildlife / Birds">🦅 <span id="cntTrkWild">0</span></button>
+            <button class="rf-btn" data-track="Landscape" title="Sun / Landscape">🌅 <span id="cntTrkLand">0</span></button>
+            <button class="rf-btn" data-track="Other" title="Other">Other</button>
+          </div>
+          <select id="speciesFilter" class="select-input sm" style="margin-top:6px"><option value="">All Species (BioCLIP 2)</option></select>
+          <select id="scenarioFilter" class="select-input sm" style="margin-top:6px">
+            <option value="">All Scenarios</option>
+            <option value="action_sequence">🎬 Action Sequence</option>
+            <option value="static_group">📸 Static Group</option>
+            <option value="single">1️⃣ Single Shot</option>
+          </select>
+          <label class="checkbox-row" style="margin-top:6px">
+            <input type="checkbox" id="chkHybridOnly" />
+            <span>✨ Golden / Hybrid Light (<span id="cntHybrid">0</span>)</span>
+          </label>
+        </div>
+
+        <!-- Camera & Lens Facets -->
+        <div class="side-section">
+          <div class="side-title">EXIF Gear</div>
+          <select id="cameraFilter" class="select-input sm"><option value="">All Cameras</option></select>
+          <select id="lensFilter" class="select-input sm" style="margin-top:6px"><option value="">All Lenses</option></select>
+          <label class="checkbox-row" style="margin-top:8px">
+            <input type="checkbox" id="chkBurstBest" />
+            <span>Only #1 sharpest per burst</span>
+          </label>
+        </div>
+      </aside>
+
+      <!-- CENTER STAGE -->
+      <main class="stage">
+        <!-- Toolbar -->
+        <div class="stage-toolbar">
+          <div class="toolbar-left">
+            <span id="resultCount" class="result-count">0 images</span>
+            <input id="searchInput" type="search" class="search-input" placeholder="Search filename, burst, bird, lens..." />
+            <label class="checkbox-row compact" title="Automatically jump to next photo after pressing 0-5 or color key">
+              <input type="checkbox" id="chkAutoAdvance" checked />
+              <span>Auto-Advance</span>
+            </label>
+          </div>
+          <div class="toolbar-right">
+            <div id="batchBar" class="batch-bar hidden">
+              <span id="batchCount">0 selected</span>
+              <button class="btn btn-xs" data-batch-rate="5">5★</button>
+              <button class="btn btn-xs" data-batch-rate="4">4★</button>
+              <button class="btn btn-xs" data-batch-rate="3">3★</button>
+              <button class="btn btn-xs" data-batch-rate="0">0★</button>
+              <button class="btn btn-xs" data-batch-label="Green">🟢</button>
+              <button class="btn btn-xs" data-batch-label="Yellow">🟡</button>
+              <button class="btn btn-xs" data-batch-label="Red">🔴</button>
+              <button class="btn btn-xs btn-accent" id="btnBatchCull">⚡ Cull Selected</button>
+              <button class="btn btn-xs btn-ghost" id="btnClearSel">Clear</button>
+            </div>
+            <label class="sort-wrap">
+              <span>Sort:</span>
+              <select id="sortSelect" class="select-input xs">
+                <option value="overall_rank:asc">AI Overall Rank</option>
+                <option value="overall_score:desc">AI Overall Score</option>
+                <option value="personal:desc">Personal Ranker Score</option>
+                <option value="sharpness:desc">Sharpness Score</option>
+                <option value="eye_contact:desc">Eye Contact Score</option>
+                <option value="action:desc">Action Score</option>
+                <option value="scenic:desc">Scenic Score</option>
+                <option value="timestamp:asc">Capture Time (Oldest)</option>
+                <option value="timestamp:desc">Capture Time (Newest)</option>
+                <option value="shutter_speed:asc">Shutter Speed (Fastest)</option>
+                <option value="rating:desc">Star Rating (Highest)</option>
+                <option value="filename:asc">Filename</option>
+              </select>
+            </label>
+            <input id="cardSizeSlider" type="range" min="160" max="360" value="230" title="Thumbnail size" class="size-slider" />
+          </div>
+        </div>
+
+        <!-- GRID VIEW -->
+        <section id="gridView" class="grid-view">
+          <div id="photoGrid" class="photo-grid"></div>
+          <div id="loadMoreWrap" class="load-more-wrap hidden">
+            <button id="btnLoadMore" class="btn btn-ghost">Load More Images</button>
+          </div>
+        </section>
+
+        <!-- LOUPE VIEW -->
+        <section id="loupeView" class="loupe-view hidden">
+          <div class="loupe-main">
+            <div class="loupe-canvas-area" id="loupeCanvasArea">
+              <button id="btnLoupePrev" class="loupe-nav prev" title="Previous (←)">‹</button>
+              <div class="loupe-img-wrap" id="loupeImgWrap">
+                <img id="loupeImg" class="loupe-img" alt="" draggable="false" />
+                <canvas id="loupeOverlay" class="loupe-overlay"></canvas>
+              </div>
+              <button id="btnLoupeNext" class="loupe-nav next" title="Next (→)">›</button>
+
+              <!-- Floating Loupe HUD -->
+              <div class="loupe-hud-top">
+                <span id="loupeFilename" class="hud-chip strong"></span>
+                <span id="loupeLayerPill" class="hud-chip"></span>
+                <span id="loupeSpeedPill" class="hud-chip"></span>
+                <div class="zoom-presets" id="zoomPresets" title="Zoom presets (Wheel or Ctrl +/-)">
+                  <button class="zp-btn active" data-zoom="fit">Fit</button>
+                  <button class="zp-btn" data-zoom="25">25%</button>
+                  <button class="zp-btn" data-zoom="50">50%</button>
+                  <button class="zp-btn" data-zoom="100">100%</button>
+                  <button class="zp-btn" data-zoom="200">200%</button>
+                  <span id="zoomPctLabel" class="zp-pct">Fit</span>
+                  <span id="resQualityBadge" class="zp-res" title="Current image resolution">HQ</span>
+                </div>
+                <button id="btnJumpFocus" class="hud-btn" title="Center zoom on camera AF focus point (A)">⊕ Focus (A)</button>
+                <button id="btnHoldFull" class="hud-btn" title="Hold button or hold Q key to peek at full 45MP image">🔬 Hold 45MP (Q)</button>
+                <button id="btnToggleAf" class="hud-btn active" title="Show/hide camera AF focus area (F)">🎯 AF (F)</button>
+                <button id="btnToggleHighlights" class="hud-btn active" title="Toggle gentle burned highlights zebra overlay (H)">☀ Highlights (H)</button>
+                <button id="btnToggleBbox" class="hud-btn" title="Toggle YOLO Subject & Head Box (B)">📦 AI Box (B)</button>
+                <button id="btnLoupeCompareBurst" class="hud-btn" title="Compare this burst side-by-side (C)">◫ Burst</button>
+              </div>
+
+              <!-- Quick Rating Bar floating bottom -->
+              <div class="loupe-hud-bottom">
+                <div class="star-picker" id="loupeStars"></div>
+                <div class="hud-sep"></div>
+                <div class="color-picker" id="loupeColors"></div>
+                <div class="hud-sep"></div>
+                <button id="btnFlagPick" class="hud-btn" title="Pick (P/F)">🏳 Pick</button>
+                <button id="btnFlagReject" class="hud-btn" title="Reject (X)">✕ Reject</button>
+                <span id="loupeXmpStatus" class="xmp-pill">XMP</span>
+              </div>
+            </div>
+
+            <!-- RIGHT INSPECTOR -->
+            <aside class="inspector">
+              <div class="insp-section">
+                <div class="insp-title">Head / Eye 1:1 Crop</div>
+                <div class="head-crop-box" id="inspCropBox" title="Click to toggle full zoom">
+                  <img id="inspCropImg" alt="Head crop" />
+                </div>
+              </div>
+
+              <div class="insp-section">
+                <div class="insp-title">AI Culling Scores <span class="muted">(Saved Separately)</span></div>
+                <div class="score-bars" id="inspScores"></div>
+                <div class="meta-kv-grid" id="inspAiMeta"></div>
+              </div>
+
+              <div class="insp-section">
+                <div class="insp-title">EXIF &amp; Shutter Speed</div>
+                <div id="inspSpeedBanner" class="speed-banner"></div>
+                <div class="meta-kv-grid" id="inspExif"></div>
+              </div>
+
+              <div class="insp-section">
+                <div class="insp-title">Rating &amp; Lightroom XMP</div>
+                <div class="meta-kv-grid" id="inspXmpMeta"></div>
+              </div>
+            </aside>
+          </div>
+
+          <!-- FILMSTRIP -->
+          <div class="filmstrip-bar">
+            <div class="filmstrip-header">
+              <div class="filmstrip-tabs">
+                <button class="fs-tab active" data-fs-mode="list">Filtered Roll</button>
+                <button class="fs-tab" data-fs-mode="burst">Current Burst (<span id="fsBurstCount">1</span>)</button>
+              </div>
+              <span id="fsPosition" class="muted">0 / 0</span>
+            </div>
+            <div id="filmstripScroll" class="filmstrip-scroll"></div>
+          </div>
+        </section>
+
+        <!-- COMPARE VIEW -->
+        <section id="compareView" class="compare-view hidden">
+          <div class="compare-header">
+            <span id="compareTitle">Side-by-Side Compare</span>
+            <div class="compare-actions">
+              <button id="btnCompareToggleCrop" class="btn btn-sm btn-ghost">🔍 Toggle Head Crops</button>
+              <button id="btnCompareExit" class="btn btn-sm btn-ghost">✕ Back to Grid</button>
+            </div>
+          </div>
+          <div id="compareGrid" class="compare-grid"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- OPEN DIRECTORY MODAL -->
+  <div id="modalOpenDir" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>📂 Open Photo Directory</h3>
+        <button class="modal-close" data-close="modalOpenDir">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="muted">Choose a folder containing CR3 / JPG images (subfolders will each appear separately in the sidebar).</p>
+        <div class="input-row">
+          <input id="inputDirPath" type="text" class="text-input" placeholder="D:\Photos\Wildlife" />
+          <button id="btnNativeBrowse" class="btn btn-ghost">Browse...</button>
+        </div>
+        <label class="checkbox-row" style="margin-top:10px">
+          <input type="checkbox" id="chkScanOnOpen" checked />
+          <span>Immediately scan EXIF, Lens, in-camera ratings &amp; Lightroom XMPs</span>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close="modalOpenDir">Cancel</button>
+        <button id="btnConfirmOpenDir" class="btn btn-primary">Open Directory</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS & XMP SYNC MODAL -->
+  <div id="modalSettings" class="modal-backdrop hidden">
+    <div class="modal-card wide">
+      <div class="modal-header">
+        <h3>⚙ Studio &amp; Lightroom XMP Settings</h3>
+        <button class="modal-close" data-close="modalSettings">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-group">
+          <h4>Real-Time XMP Sync (Manual Edits)</h4>
+          <label class="checkbox-row">
+            <input type="checkbox" id="setRealtimeXmp" />
+            <span>Write star ratings &amp; color labels to <code>.xmp</code> sidecar in real time (preserves all Lightroom Develop edits)</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="setAutoAdvance" />
+            <span>Auto-advance to next image after rating in Loupe view</span>
+          </label>
+        </div>
+
+        <div class="settings-group">
+          <h4>AI Culling Result → XMP Reflection (Optional)</h4>
+          <p class="muted">AI culling results are always saved separately in the studio database. Configure below if you also want to mirror them to Lightroom XMP files:</p>
+          <label class="checkbox-row">
+            <input type="checkbox" id="setAiAutoApply" />
+            <span>Automatically apply this mapping to XMP when a culling run finishes</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="setAiOnlyUnrated" />
+            <span>Protect existing ratings: only write to images that have no camera/XMP rating or label yet</span>
+          </label>
+
+          <table class="mapping-table">
+            <thead>
+              <tr><th>AI Layer</th><th>Sync</th><th>Star Rating</th><th>Color Label</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="dot dot-l2"></span> Layer 2 (To Edit)</td>
+                <td><input type="checkbox" id="mapL2Enabled" /></td>
+                <td><select id="mapL2Rating" class="select-input xs"><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
+                <td><select id="mapL2Label" class="select-input xs"><option value="">None</option><option value="Red">Red</option><option value="Yellow">Yellow</option><option value="Green">Green</option><option value="Blue">Blue</option><option value="Purple">Purple</option></select></td>
+              </tr>
+              <tr>
+                <td><span class="dot dot-l1"></span> Layer 1 (Keep)</td>
+                <td><input type="checkbox" id="mapL1Enabled" /></td>
+                <td><select id="mapL1Rating" class="select-input xs"><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
+                <td><select id="mapL1Label" class="select-input xs"><option value="">None</option><option value="Red">Red</option><option value="Yellow">Yellow</option><option value="Green">Green</option><option value="Blue">Blue</option><option value="Purple">Purple</option></select></td>
+              </tr>
+              <tr>
+                <td><span class="dot dot-rej"></span> Not Selected</td>
+                <td><input type="checkbox" id="mapRejEnabled" /></td>
+                <td><select id="mapRejRating" class="select-input xs"><option value="">Keep</option><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
+                <td><select id="mapRejLabel" class="select-input xs"><option value="">None</option><option value="Red">Red</option><option value="Yellow">Yellow</option><option value="Green">Green</option><option value="Blue">Blue</option><option value="Purple">Purple</option></select></td>
+              </tr>
+              <tr>
+                <td><span class="dot dot-del"></span> To Delete (Bad/Blur)</td>
+                <td><input type="checkbox" id="mapDelEnabled" /></td>
+                <td><select id="mapDelRating" class="select-input xs"><option value="">Keep</option><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
+                <td><select id="mapDelLabel" class="select-input xs"><option value="">None</option><option value="Red">Red</option><option value="Yellow">Yellow</option><option value="Green">Green</option><option value="Blue">Blue</option><option value="Purple">Purple</option></select></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="sync-action-row">
+            <button id="btnDryRunAiXmp" class="btn btn-ghost btn-sm">Preview Impact (Dry Run)</button>
+            <button id="btnApplyAiXmp" class="btn btn-accent btn-sm">Apply AI Mapping to XMP Now</button>
+            <span id="aiXmpStatusMsg" class="muted"></span>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <h4>Fast Review &amp; Zoom Preview Quality</h4>
+          <div class="inline-fields">
+            <label>Fit Preview (px): <input id="setHqDim" type="number" min="800" max="2400" step="100" class="text-input xs" /></label>
+            <label>Fit Quality: <input id="setHqQuality" type="number" min="60" max="96" class="text-input xs" /></label>
+          </div>
+          <div class="inline-fields" style="margin-top:6px">
+            <label>Zoom Preview Size:
+              <select id="setZoomDim" class="select-input xs">
+                <option value="8192">8192px (Full 45MP · Sharpest · Zero Re-encode)</option>
+                <option value="4096">4096px (11MP Medium)</option>
+                <option value="3072">3072px (6MP Light)</option>
+              </select>
+            </label>
+            <label>Zoom Quality: <input id="setZoomQuality" type="number" min="70" max="96" class="text-input xs" /></label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close="modalSettings">Close</button>
+        <button id="btnSaveSettings" class="btn btn-primary">Save Settings</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- LOGS, PROCESS & CHANGE RESTORE DRAWER -->
+  <div id="modalLogs" class="modal-backdrop hidden">
+    <div class="modal-card xwide">
+      <div class="modal-header">
+        <h3>📜 Process Logs, Pipeline Runs &amp; Change Restore</h3>
+        <button class="modal-close" data-close="modalLogs">✕</button>
+      </div>
+      <div class="modal-tabs">
+        <button class="m-tab active" data-log-tab="events">Live Event Logs</button>
+        <button class="m-tab" data-log-tab="changes">Change History &amp; Restore</button>
+        <button class="m-tab" data-log-tab="runs">Pipeline Runs</button>
+      </div>
+      <div class="modal-body log-body">
+        <div id="tabEvents" class="log-pane">
+          <div class="log-filter-bar">
+            <select id="logLevelFilter" class="select-input xs"><option value="">All Levels</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select>
+            <select id="logCatFilter" class="select-input xs"><option value="">All Categories</option><option value="perf">Perf / Lag</option><option value="pipeline">Pipeline</option><option value="xmp">XMP</option><option value="preview">Previews</option><option value="scan">Scan</option><option value="system">System</option></select>
+            <button id="btnRefreshLogs" class="btn btn-xs btn-ghost">↻ Refresh</button>
+          </div>
+          <div id="eventLogList" class="event-log-list"></div>
+        </div>
+
+        <div id="tabChanges" class="log-pane hidden">
+          <p class="muted">Every star rating, color label, and AI-to-XMP sync is recorded with a snapshot of the previous XMP file so you can restore any change.</p>
+          <table class="data-table">
+            <thead><tr><th>Time</th><th>File</th><th>Action</th><th>Change</th><th>XMP</th><th>Restore</th></tr></thead>
+            <tbody id="changeLogBody"></tbody>
+          </table>
+        </div>
+
+        <div id="tabRuns" class="log-pane hidden">
+          <table class="data-table">
+            <thead><tr><th>Started</th><th>Mode</th><th>Status</th><th>Processed</th><th>Errors</th><th>Summary</th></tr></thead>
+            <tbody id="runsLogBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- LEARNING & INSIGHTS MODAL -->
+  <div id="modalLearning" class="modal-backdrop hidden">
+    <div class="modal-card wide">
+      <div class="modal-header">
+        <h3>🧠 Learning &amp; AI Agreement Insights</h3>
+        <button class="modal-close" data-close="modalLearning">✕</button>
+      </div>
+      <div class="modal-body" id="learningBody">
+        <p class="muted">Loading insights...</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- SHORTCUTS MODAL -->
+  <div id="modalShortcuts" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>⌨️ Super-Fast Keyboard Shortcuts</h3>
+        <button class="modal-close" data-close="modalShortcuts">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="shortcut-grid">
+          <div><kbd>0</kbd>–<kbd>5</kbd></div><div>Set Star Rating (writes XMP live)</div>
+          <div><kbd>6</kbd> <kbd>7</kbd> <kbd>8</kbd> <kbd>9</kbd> <kbd>P</kbd></div><div>Color Label: Red / Yellow / Green / Blue / Purple</div>
+          <div><kbd>←</kbd> / <kbd>→</kbd></div><div>Previous / Next image</div>
+          <div><kbd>G</kbd> / <kbd>E</kbd> / <kbd>C</kbd></div><div>Grid / Loupe / Compare view</div>
+          <div><kbd>Z</kbd> or <kbd>Space</kbd></div><div>Toggle Fit ↔ 100% Zoom (at AF Focus point)</div>
+          <div><kbd>Ctrl</kbd>+<kbd>+</kbd>/<kbd>-</kbd>/<kbd>0</kbd></div><div>Zoom In / Zoom Out / Fit (or Mouse Wheel)</div>
+          <div><kbd>Drag</kbd></div><div>Pan zoomed photo (←/→ keeps zoom position!)</div>
+          <div><kbd>A</kbd></div><div>Jump zoomed view to camera AF Focus point</div>
+          <div><kbd>Hold Q</kbd></div><div>Peek at full 45MP image while holding Q</div>
+          <div><kbd>F</kbd> / <kbd>H</kbd> / <kbd>B</kbd></div><div>Toggle Camera AF Box / Burned Highlights / YOLO AI Box</div>
+          <div><kbd>X</kbd> / <kbd>U</kbd></div><div>Reject flag / Clear flag</div>
+          <div><kbd>Ctrl+Z</kbd></div><div>Undo last rating / color / XMP change</div>
+          <div><kbd>Esc</kbd></div><div>Exit Loupe / Close modal / Clear selection</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

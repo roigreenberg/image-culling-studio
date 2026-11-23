@@ -1,0 +1,873 @@
+import json
+import os
+import shutil
+import tempfile
+import time
+
+import pandas as pd
+
+from .config import (
+    DATABASE_NAME,
+    METADATA_FILENAME,
+    PIPELINE_MAJOR,
+    PIPELINE_VERSION,
+    SCENEDATA_FILENAME,
+)
+from .logging_utils import log_warning, utc_now_naive
+
+# Leveled console logging — kestrel_analyzer is sometimes imported standalone
+# (e.g. tests), so fall back to a no-op if settings_utils isn't reachable.
+try:
+    from ..settings_utils import info as _info, warn as _warn
+except (ImportError, ValueError):
+    # cli.py imports kestrel_analyzer as a top-level package; relative ``..``
+    # walks above the root. Bare ``settings_utils`` works because analyzer/
+    # is on sys.path in that case.
+    try:
+        from settings_utils import info as _info, warn as _warn  # type: ignore
+    except ImportError:
+        def _info(*_a, **_kw): pass
+        def _warn(*_a, **_kw): pass
+
+# Columns written by the analysis pipeline only (no user-editable data).
+BASE_COLUMNS = [
+    "filename",
+    "species",
+    "species_confidence",
+    "family",
+    "family_confidence",
+    # The EFFECTIVE quality (0-1, -1 = unrated): whichever of the two stored
+    # scorer outputs below the ``quality_model`` setting selects (see
+    # quality_model.py). Every existing reader keeps using this column.
+    "quality",
+    "export_path",
+    "crop_path",
+    "crops_json",
+    "primary_crop_index",
+    "scene_count",
+    "feature_similarity",
+    "feature_confidence",
+    "color_similarity",
+    "color_confidence",
+    "similar",
+    "secondary_species_list",
+    "secondary_species_scores",
+    "secondary_family_list",
+    "secondary_family_scores",
+    "exposure_correction",
+    "exposure_pipeline",
+    "exposure_subject_stops",
+    "exposure_meter_scale",
+    "detection_scores",
+    "capture_time",
+    # Size in bytes of the source image at analysis time. Half of the identity
+    # key: a database row corresponds to a photo by (filename, file_size), not
+    # by filename alone. Filename alone cannot tell IMG_0005.CR3 on a reshot SD
+    # card from the IMG_0005.CR3 that was analysed before it, so the pipeline
+    # skipped the new photo and the UI showed metadata for a photo that no
+    # longer existed. Blank on rows written before this column existed — see
+    # ``ensure_columns`` — and every consumer must fall back to filename-only
+    # matching when it is blank rather than treating blank as a mismatch.
+    "file_size",
+    # Schema 3 (pipeline 3.0.0): the raw 0-1 output of each quality scorer for
+    # the primary crop (per-crop copies live in ``crops_json``). -1 = not
+    # scored. ``quality_siglip`` is the SigLIP 2 zero-shot sharpness score
+    # (default), ``quality_legacy`` the pre-3.0 quality CNN.
+    "quality_siglip",
+    "quality_legacy",
+]
+
+# Legacy user-editable columns previously stored in kestrel_database.csv.
+# Migrated to kestrel_scenedata.json on first upgrade and stripped from the CSV.
+LEGACY_USER_COLUMNS = ["rating", "normalized_rating", "scene_name", "rating_origin"]
+
+# Schema version for kestrel_scenedata.json
+SCENEDATA_VERSION = "2.0"
+
+# Schema version for kestrel_database.csv, recorded in kestrel_metadata.json.
+#
+# Distinct from the app version already stored there. The app version is a
+# proxy that answers the wrong question — it says which build wrote the folder,
+# not which columns that build wrote — and it stops working the first time a
+# schema change ships in a patch release or a schema is left unchanged across
+# several releases. Migration code needs to branch on the schema, so the schema
+# gets its own number.
+#
+#   1  everything up to and including the Dusky-Grouse release
+#   2  adds ``file_size`` (see BASE_COLUMNS)
+#   3  pipeline 3.0.0: adds ``quality_siglip`` + ``quality_legacy``; ``quality``
+#      becomes the effective score selected by the ``quality_model`` setting
+#
+# Bump this when BASE_COLUMNS changes meaning or shape, and add a fixture under
+# tests/fixtures/legacy_databases/ (see that directory's SCHEMA_NOTES.md).
+# Absent from a folder's metadata means "1 or older" — it is not an error, and
+# most folders in the wild will never carry it.
+DATABASE_SCHEMA_VERSION = 3
+
+REQUIRED_COLUMNS = [
+    "family",
+    "family_confidence",
+    "secondary_family_list",
+    "secondary_family_scores",
+]
+
+
+def load_database(kestrel_dir: str, analyzer_name: str, log_path: str = None):
+    db_path = os.path.join(kestrel_dir, DATABASE_NAME)
+    metadata_path = os.path.join(kestrel_dir, METADATA_FILENAME)
+
+    if os.path.exists(db_path):
+        database = read_database_csv(db_path)
+        # Upgrade legacy database: migrate user columns to scenedata.json
+        if _needs_upgrade(database, kestrel_dir):
+            database = _perform_db_upgrade(database, kestrel_dir, db_path, log_path)
+    else:
+        database = pd.DataFrame(columns=BASE_COLUMNS)
+        try:
+            if not os.path.exists(metadata_path):
+                metadata = {
+                    "pipeline_version": PIPELINE_VERSION,
+                    "pipeline_major": PIPELINE_MAJOR,
+                    "schema_version": DATABASE_SCHEMA_VERSION,
+                    "analyzer": analyzer_name,
+                    "created_utc": utc_now_naive().isoformat() + "Z",
+                    "database_file": DATABASE_NAME,
+                }
+                with open(metadata_path, "w", encoding="utf-8") as mf:
+                    json.dump(metadata, mf, indent=2)
+        except Exception as e:
+            if log_path:
+                log_warning(
+                    log_path,
+                    f"Failed to write metadata file: {e}",
+                    category=type(e),
+                    stage="metadata_write",
+                    context={"metadata_path": metadata_path},
+                )
+            else:
+                _warn(f"[database] failed to write metadata file: {e}")
+
+    database = ensure_columns(database)
+    return database, db_path
+
+
+def _needs_upgrade(database: pd.DataFrame, kestrel_dir: str) -> bool:
+    """Return True if the database has legacy user columns and scenedata.json doesn't exist yet."""
+    has_legacy = any(col in database.columns for col in LEGACY_USER_COLUMNS)
+    scenedata_exists = os.path.exists(os.path.join(kestrel_dir, SCENEDATA_FILENAME))
+    return has_legacy and not scenedata_exists
+
+
+def _perform_db_upgrade(
+    database: pd.DataFrame, kestrel_dir: str, db_path: str, log_path: str = None
+) -> pd.DataFrame:
+    """Migrate legacy database: extract user data to scenedata.json and strip legacy columns.
+
+    The live CSV is renamed and stripped only after scenedata is saved.
+    If that save fails, the original CSV (including ratings) is left intact
+    and the error is re-raised so callers do not treat the upgrade as done.
+    """
+    # Build and save scenedata from legacy database
+    try:
+        scenedata = _build_scenedata_from_legacy_db(database)
+        save_scenedata(scenedata, kestrel_dir)
+        _info(f"[database] Migrated legacy user data to {SCENEDATA_FILENAME}")
+    except Exception as e:
+        if log_path:
+            log_warning(
+                log_path,
+                f"Failed to migrate legacy database to {SCENEDATA_FILENAME}: {e}",
+                category=type(e),
+                stage="db_upgrade",
+                context={"kestrel_dir": kestrel_dir},
+            )
+        else:
+            _warn(f"[database] failed to migrate legacy database: {e}")
+        raise
+
+    # Rename old CSV as backup, then save new one without legacy columns
+    try:
+        timestamp = utc_now_naive().strftime("%Y%m%d_%H%M%S")
+        old_path = os.path.join(kestrel_dir, f"OLD_kestrel_database_{timestamp}.csv")
+        os.rename(db_path, old_path)
+        cleaned = database.drop(
+            columns=[c for c in LEGACY_USER_COLUMNS if c in database.columns],
+            errors="ignore",
+        )
+        _to_csv_atomic(cleaned, db_path)
+        _info(
+            f"[database] Upgrade complete: backup at {os.path.basename(old_path)}, "
+            f"new clean {DATABASE_NAME} saved."
+        )
+    except Exception as e:
+        if log_path:
+            log_warning(
+                log_path,
+                f"Failed to rename/save upgraded database: {e}",
+                category=type(e),
+                stage="db_upgrade",
+                context={"kestrel_dir": kestrel_dir},
+            )
+        else:
+            _warn(f"[database] failed to save upgraded database: {e}")
+
+    return database.drop(
+        columns=[c for c in LEGACY_USER_COLUMNS if c in database.columns],
+        errors="ignore",
+    )
+
+
+def _build_scenedata_from_legacy_db(database: pd.DataFrame) -> dict:
+    """Build a fresh scenedata dict from a legacy database DataFrame, preserving user edits."""
+    scenedata: dict = {
+        "version": SCENEDATA_VERSION,
+        "image_ratings": {},
+        "scenes": {},
+    }
+
+    # Extract per-image manual ratings
+    if "rating" in database.columns:
+        has_origin = "rating_origin" in database.columns
+        for _, row in database.iterrows():
+            filename = str(row.get("filename", ""))
+            if not filename:
+                continue
+            if has_origin:
+                raw_origin = row.get("rating_origin", "")
+                # A blank field is read by pd.read_csv as NaN, so str(NaN) would
+                # be 'nan' rather than ''. Normalize NaN/None/whitespace to ''
+                # so a blank origin is treated as "no explicit origin".
+                origin = "" if pd.isna(raw_origin) else str(raw_origin).strip().lower()
+            else:
+                origin = ""
+            rating_val = row.get("rating", None)
+            try:
+                r = int(float(rating_val))
+            except (TypeError, ValueError):
+                continue
+            # Preserve a real 1-5 rating unless it is explicitly an auto rating.
+            # A blank origin is treated like "no origin column": a rating with no
+            # explicit 'auto' marker is assumed to be user intent, so it is not
+            # dropped during migration. (Previously, when a rating_origin column
+            # existed but was blank for a manually-rated row, the rating was
+            # silently lost.) Explicit 'auto' ratings are left for recomputation.
+            if 1 <= r <= 5 and origin in ("", "manual"):
+                scenedata["image_ratings"][filename] = r
+
+    # Build scenes from scene_count grouping
+    if "scene_count" in database.columns:
+        groups: dict = {}
+        for _, row in database.iterrows():
+            sc = str(row.get("scene_count", "0"))
+            if sc not in groups:
+                groups[sc] = []
+            fname = str(row.get("filename", ""))
+            if fname:
+                groups[sc].append(fname)
+
+        for sc, filenames in groups.items():
+            scene_name = ""
+            if "scene_name" in database.columns:
+                mask = database["scene_count"].astype(str) == sc
+                for sn in database.loc[mask, "scene_name"]:
+                    if str(sn).strip():
+                        scene_name = str(sn).strip()
+                        break
+            scenedata["scenes"][sc] = {
+                "scene_id": sc,
+                "image_filenames": filenames,
+                "name": scene_name,
+                "status": "pending",
+                "user_tags": {
+                    "species": [],
+                    "families": [],
+                    "finalized": False,
+                },
+            }
+
+    return scenedata
+
+
+def build_scenedata_from_database(database: pd.DataFrame) -> dict:
+    """Build a fresh scenedata dict from a clean (non-legacy) database.
+
+    Used when creating a new kestrel_scenedata.json for a freshly-analyzed folder.
+    """
+    scenedata: dict = {
+        "version": SCENEDATA_VERSION,
+        "image_ratings": {},
+        "scenes": {},
+    }
+
+    if "scene_count" not in database.columns or database.empty:
+        return scenedata
+
+    groups: dict = {}
+    for _, row in database.iterrows():
+        sc = str(row.get("scene_count", "0"))
+        if sc not in groups:
+            groups[sc] = []
+        fname = str(row.get("filename", ""))
+        if fname:
+            groups[sc].append(fname)
+
+    for sc, filenames in groups.items():
+        scenedata["scenes"][sc] = {
+            "scene_id": sc,
+            "image_filenames": filenames,
+            "name": "",
+            "status": "pending",
+            "user_tags": {
+                "species": [],
+                "families": [],
+                "finalized": False,
+            },
+        }
+
+    return scenedata
+
+
+def update_scenedata_with_database(scenedata: dict, database: pd.DataFrame) -> dict:
+    """Update existing scenedata by adding newly-analyzed images from database.
+
+    New images are added to their correct scenes (by scene_count) without overwriting
+    any user-edited data (ratings, names, tags, custom scene membership).
+    Returns the mutated scenedata dict.
+    """
+    if (
+        "filename" not in database.columns
+        or "scene_count" not in database.columns
+        or database.empty
+    ):
+        return scenedata
+
+    # Build set of all filenames already tracked in scenedata
+    known: set = set()
+    for scene_entry in scenedata.get("scenes", {}).values():
+        for fname in scene_entry.get("image_filenames", []):
+            known.add(fname)
+
+    scenes = scenedata.setdefault("scenes", {})
+    for _, row in database.iterrows():
+        fname = str(row.get("filename", ""))
+        if not fname or fname in known:
+            continue
+        sc = str(row.get("scene_count", "0"))
+        if sc not in scenes:
+            scenes[sc] = {
+                "scene_id": sc,
+                "image_filenames": [],
+                "name": "",
+                "status": "pending",
+                "user_tags": {"species": [], "families": [], "finalized": False},
+            }
+        scenes[sc]["image_filenames"].append(fname)
+        known.add(fname)
+
+    return scenedata
+
+
+class ScenedataCorruptError(ValueError):
+    """Raised when kestrel_scenedata.json exists but cannot be loaded as a JSON object.
+
+    A missing file is a fresh folder. A corrupt file is not: callers that treat
+    empty ``scenes`` as "rebuild from CSV" would overwrite user ratings.
+    """
+
+
+def merge_scenedata_ui_fields(target: dict, source: dict) -> dict:
+    """Overlay UI-owned fields from ``source`` onto ``target``.
+
+    ``image_ratings``: source wins per filename. Per-scene ``name``,
+    ``status``, and ``user_tags``: source wins when the scene id exists in
+    both. Scene membership (``image_filenames``) is left to the analysis
+    database. Mutates and returns ``target``.
+    """
+    src_ratings = source.get("image_ratings")
+    if isinstance(src_ratings, dict) and src_ratings:
+        dst_ratings = target.setdefault("image_ratings", {})
+        if isinstance(dst_ratings, dict):
+            dst_ratings.update(src_ratings)
+
+    src_scenes = source.get("scenes")
+    dst_scenes = target.setdefault("scenes", {})
+    if not isinstance(src_scenes, dict) or not isinstance(dst_scenes, dict):
+        return target
+    for sid, src_scene in src_scenes.items():
+        if not isinstance(src_scene, dict):
+            continue
+        dst = dst_scenes.get(str(sid))
+        if dst is None and sid != str(sid):
+            dst = dst_scenes.get(sid)
+        if not isinstance(dst, dict):
+            continue
+        for field in ("name", "status", "user_tags"):
+            if field in src_scene:
+                dst[field] = src_scene[field]
+    return target
+
+
+def finalize_scenedata_after_analysis(kestrel_dir: str, database: pd.DataFrame) -> None:
+    """Write scenedata after analysis without clobbering concurrent UI edits.
+
+    Reloads from disk immediately before save and overlays ratings, scene
+    names, approve status, and ``user_tags`` so a stale in-memory copy
+    cannot wipe what the UI already persisted.
+    """
+    existing = load_scenedata(kestrel_dir)
+    if not existing.get("scenes"):
+        out = build_scenedata_from_database(database)
+    else:
+        out = update_scenedata_with_database(existing, database)
+    latest = load_scenedata(kestrel_dir)
+    merge_scenedata_ui_fields(out, latest)
+    save_scenedata(out, kestrel_dir)
+
+
+def load_scenedata(kestrel_dir: str) -> dict:
+    """Load kestrel_scenedata.json.
+
+    Returns an empty initialized dict if the file is missing. If the file
+    exists but cannot be read or parsed as a JSON object, raises
+    :class:`ScenedataCorruptError` instead of returning empty.
+    """
+    scenedata_path = os.path.join(kestrel_dir, SCENEDATA_FILENAME)
+    if not os.path.exists(scenedata_path):
+        return {"version": SCENEDATA_VERSION, "image_ratings": {}, "scenes": {}}
+
+    try:
+        with open(scenedata_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        _warn(f"[database] failed to load {SCENEDATA_FILENAME}: {e}")
+        raise ScenedataCorruptError(
+            f"{SCENEDATA_FILENAME} exists but is unreadable: {e}"
+        ) from e
+
+    if not isinstance(data, dict):
+        _warn(
+            f"[database] failed to load {SCENEDATA_FILENAME}: "
+            f"expected a JSON object, got {type(data).__name__}"
+        )
+        raise ScenedataCorruptError(
+            f"{SCENEDATA_FILENAME} exists but is not a JSON object "
+            f"(got {type(data).__name__})"
+        )
+
+    data.setdefault("version", SCENEDATA_VERSION)
+    data.setdefault("image_ratings", {})
+    data.setdefault("scenes", {})
+    return data
+
+
+def save_scenedata(scenedata: dict, kestrel_dir: str) -> None:
+    """Save scenedata dict to kestrel_scenedata.json.
+
+    Written atomically: scenedata holds the user's ratings, tags and Accept/
+    Reject decisions, so a partial write from a crash/power loss must never
+    truncate the existing file.
+    """
+    scenedata_path = os.path.join(kestrel_dir, SCENEDATA_FILENAME)
+    write_json_atomic(scenedata_path, scenedata, indent=2)
+
+
+def parse_file_size(value) -> "int | None":
+    """Coerce a stored ``file_size`` cell to an int, or ``None`` if unknown.
+
+    Shared by the pipeline's skip test and the folder-diff repair scan so the
+    two can never disagree about what counts as a known size. Returns ``None``
+    for every "we don't know" spelling this column takes in the wild: absent
+    (legacy rows predating the column), blank, ``NaN`` from ``pd.read_csv``,
+    the string ``'nan'`` after a CSV round-trip, or a negative sentinel.
+
+    ``None`` means *unknown*, and callers must fall back to filename-only
+    matching for that row. It must never be conflated with ``0``, which is a
+    real size that would make every legacy row mismatch its file on disk.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in ("nan", "none", ""):
+        return None
+    try:
+        size = int(float(text))
+    except (TypeError, ValueError):
+        return None
+    return size if size >= 0 else None
+
+
+def ensure_columns(database: pd.DataFrame) -> pd.DataFrame:
+    """Ensure required analysis columns exist with appropriate defaults."""
+    for col in REQUIRED_COLUMNS:
+        if col not in database.columns:
+            if col.endswith("_list"):
+                database[col] = [[] for _ in range(len(database))]
+            elif col.endswith("_scores"):
+                database[col] = [[] for _ in range(len(database))]
+            else:
+                database[col] = "Unknown" if "family" in col else 0.0
+    if "exposure_correction" not in database.columns:
+        database["exposure_correction"] = 0.0
+    if "exposure_pipeline" not in database.columns:
+        database["exposure_pipeline"] = "legacy_auto_bright_v1"
+    if "exposure_subject_stops" not in database.columns:
+        database["exposure_subject_stops"] = 0.0
+    if "exposure_meter_scale" not in database.columns:
+        database["exposure_meter_scale"] = 1.0
+    if "detection_scores" not in database.columns:
+        database["detection_scores"] = [[] for _ in range(len(database))]
+    if "crops_json" not in database.columns:
+        database["crops_json"] = "[]"
+    if "primary_crop_index" not in database.columns:
+        database["primary_crop_index"] = 0
+    if "capture_time" not in database.columns:
+        database["capture_time"] = ""
+    if "file_size" not in database.columns:
+        # Blank, not 0: a legacy row has an *unknown* size, and 0 is a real
+        # (if degenerate) size that would make every legacy row look like a
+        # mismatch against the file on disk.
+        database["file_size"] = ""
+    if "quality_legacy" not in database.columns:
+        # Before schema 3 the only quality scorer WAS the legacy CNN, so a
+        # pre-3.0 row's ``quality`` is its legacy score.
+        if "quality" in database.columns:
+            database["quality_legacy"] = database["quality"]
+        else:
+            database["quality_legacy"] = -1.0
+    if "quality_siglip" not in database.columns:
+        database["quality_siglip"] = -1.0
+    return database
+
+
+# Columns the UI writes to the CSV that the pipeline should preserve.
+# These are NOT in BASE_COLUMNS but may be added by the UI's saveCsv().
+_UI_PRESERVE_COLUMNS = ["culled", "culled_origin"]
+
+# Retry ceiling for the preserve-read inside ``save_database``.
+#
+# ``retry_on_file_lock`` escalates its backoff (delay * (attempt + 1)), so the
+# default 12 attempts at 20ms cap out around 1.3s; 20 attempts reaches roughly
+# 3.8s. The pipeline saves after every image while the UI's auto-refresh timer
+# reads the same file, and on Windows those collide by design -- see
+# ``retry_on_file_lock``, which describes the window as "wide open in practice".
+# Losing that race used to abort the run, so the writer is given a longer ceiling
+# than the shared default. It stays local to the writer: the UI's readers must
+# stay responsive and are better off failing fast and retrying on the next tick.
+_SAVE_PRESERVE_READ_ATTEMPTS = 20
+
+# Prefix/suffix for the temp file used by ``_to_csv_atomic``. Distinctive so a
+# temp left behind by a crashed/killed save is identifiable, and so it never
+# collides with the ``OLD_kestrel_database_*.csv`` upgrade backups.
+_TMP_FILE_PREFIX = ".kestrel_database_"
+_TMP_FILE_SUFFIX = ".csv.tmp"
+
+
+def retry_on_file_lock(op, attempts: int = 12, delay: float = 0.02):
+    """Run ``op()``, retrying briefly on Windows' transient file-sharing errors.
+
+    ``os.replace`` is atomic on both POSIX and Windows, but Windows adds a
+    constraint POSIX does not have: CPython opens files without
+    ``FILE_SHARE_DELETE``, so while *any* handle is open on the destination the
+    underlying ``MoveFileEx`` fails with ``ERROR_ACCESS_DENIED`` (5) or
+    ``ERROR_SHARING_VIOLATION`` (32). Symmetrically, a reader that calls
+    ``open()`` during the rename can catch the destination in a delete-pending
+    state and get ``ERROR_ACCESS_DENIED``. Both surface as ``PermissionError``.
+
+    So on Windows the atomic write guarantees all-or-nothing *content* but not a
+    collision-free ``open()``: the pipeline saving after every image and the UI's
+    auto-refresh reader will occasionally step on each other in both directions.
+    Both sides retry through here rather than failing — the writer to avoid
+    silently dropping a save, the reader to avoid a spurious load error.
+
+    Escalating backoff caps the total wait at roughly 1.3s; if the file is still
+    locked after that the error propagates to the caller. POSIX never raises
+    here and always succeeds on the first attempt.
+
+    This is a mitigation, not a guarantee. A reader that reopens the file in a
+    zero-gap loop can starve the writer past the retry window — genuinely fixing
+    that would mean opening the destination with ``FILE_SHARE_DELETE``, which
+    CPython's ``open()`` cannot do. The app's readers poll on a UI timer, so the
+    window is wide open in practice.
+    """
+    for attempt in range(attempts):
+        try:
+            return op()
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
+def read_database_csv(
+    db_path: str, *, attempts: int | None = None, **read_csv_kwargs
+) -> pd.DataFrame:
+    """``pd.read_csv(db_path)`` that tolerates a concurrent atomic save.
+
+    Use this anywhere the analysis pipeline might be writing the same CSV. See
+    ``retry_on_file_lock`` for why the bare call is not enough on Windows.
+
+    ``attempts`` overrides the retry ceiling for callers that can afford to wait
+    longer than the default. It is deliberately opt-in: the UI's auto-refresh
+    reader goes through here too, and raising the shared default would make the
+    window block for seconds on a contended read. ``None`` keeps
+    ``retry_on_file_lock``'s own default so the ceiling lives in one place.
+    """
+    def _read() -> pd.DataFrame:
+        return pd.read_csv(db_path, **read_csv_kwargs)
+
+    if attempts is None:
+        return retry_on_file_lock(_read)
+    return retry_on_file_lock(_read, attempts=attempts)
+
+
+def read_database_text(db_path: str) -> str:
+    """Read the CSV as raw text, tolerating a concurrent atomic save.
+
+    The bridge hands the file to the frontend verbatim rather than parsing it,
+    so it needs the text form of ``read_database_csv``.
+    """
+    def _read() -> str:
+        with open(db_path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    return retry_on_file_lock(_read)
+
+
+def _to_csv_atomic(database: pd.DataFrame, db_path: str) -> None:
+    """Write ``database`` to ``db_path`` so readers never observe a partial file.
+
+    ``DataFrame.to_csv(path)`` truncates the destination and streams rows into
+    it. The analysis pipeline saves after every processed image while the UI's
+    auto-refresh timer reads the same path (``read_kestrel_csv`` /
+    ``apply_normalization``), so a reader landing mid-write sees either an empty
+    file (pandas ``EmptyDataError: No columns to parse from file``) or a row cut
+    inside a quoted field such as ``crops_json`` (pandas ``ParserError: EOF
+    inside string starting at row N``).
+
+    Write to a unique temp file in the same directory and ``os.replace`` it into
+    place instead. ``os.replace`` is atomic on POSIX and on Windows, so a
+    concurrent reader observes either the complete previous file or the complete
+    new one. This mirrors the atomic-save pattern in ``settings_utils.save_settings``.
+    """
+    directory = os.path.dirname(db_path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    # mkstemp creates with O_EXCL, so concurrent saves can never share a path.
+    tmp_fd, tmp = tempfile.mkstemp(
+        prefix=_TMP_FILE_PREFIX,
+        suffix=_TMP_FILE_SUFFIX,
+        dir=directory,
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8", newline="") as f:
+            database.to_csv(f, index=False)
+            # flush() errors (ENOSPC, EIO) must propagate: a partial temp
+            # file must not be os.replace'd over a good destination.
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync can legitimately fail on some network filesystems
+                # (SMB/NFS shares are a common target); the replace below
+                # still gives readers an all-or-nothing view.
+                pass
+        retry_on_file_lock(lambda: os.replace(tmp, db_path))
+    except BaseException:
+        # Do NOT fall back to a direct write — that is the partial-read path
+        # this function exists to close. Leave the previous file intact.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def copy_file_atomic(src_path: str, dst_path: str) -> None:
+    """Copy ``src_path`` onto ``dst_path`` atomically (temp file + os.replace).
+
+    Used by the backup-restore path: ``shutil.copy2`` writes the destination in
+    place, so an interrupted restore (this runs right after a risky operation
+    like reject-and-move, exactly when a crash is plausible) could leave the
+    live database/scenedata half-overwritten and corrupt. Copying raw bytes to a
+    temp file in the same directory and ``os.replace``-ing it in gives readers /
+    a crash an all-or-nothing view, and preserves the file's exact encoding/BOM.
+    Content is flushed+fsync'd before the replace (matching ``_to_csv_atomic``'s
+    durability), and file metadata (mode/mtime) is preserved like the previous
+    ``shutil.copy2``.
+    """
+    directory = os.path.dirname(dst_path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    tmp_fd, tmp = tempfile.mkstemp(prefix=".kestrel_atomic_", suffix=".tmp", dir=directory)
+    try:
+        # If fdopen raises it hasn't taken ownership of the descriptor; close it
+        # explicitly so it can't leak.
+        try:
+            dst_f = os.fdopen(tmp_fd, "wb")
+        except BaseException:
+            os.close(tmp_fd)
+            raise
+        # Close dst_f in a finally rather than relying on the with-statement's
+        # ordering: if opening the source (or the copy) raises, the destination
+        # handle must still be released. A leaked handle on Windows can block
+        # the os.replace below and strand the .tmp file. close() on an
+        # already-closed handle is a harmless no-op.
+        try:
+            with open(src_path, "rb") as src_f:
+                shutil.copyfileobj(src_f, dst_f)
+                dst_f.flush()
+                try:
+                    os.fsync(dst_f.fileno())
+                except OSError:
+                    # fsync can legitimately fail on some network filesystems;
+                    # the replace below still gives readers an all-or-nothing
+                    # view.
+                    pass
+        finally:
+            dst_f.close()
+        # Preserve mode/mtime as the previous shutil.copy2 did (best-effort).
+        try:
+            shutil.copystat(src_path, tmp)
+        except OSError:
+            pass
+        retry_on_file_lock(lambda: os.replace(tmp, dst_path))
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_file_atomic(path: str, write_fn, encoding: str = "utf-8") -> None:
+    """Atomically write by calling ``write_fn(file)`` on a temp file, then replace.
+
+    ``write_fn`` receives an open text file (encoding/newline already set) and
+    must write the full payload into it. Shared by ``write_text_atomic`` and
+    ``write_json_atomic``. Mirrors ``_to_csv_atomic`` / ``settings_utils.save_settings``.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    tmp_fd, tmp = tempfile.mkstemp(prefix=".kestrel_atomic_", suffix=".tmp", dir=directory)
+    try:
+        # If os.fdopen raises, it has NOT taken ownership of tmp_fd, so the
+        # descriptor would leak (and on Windows keep the temp file locked). Close
+        # it explicitly in that case; on success the with-block owns and closes it.
+        try:
+            f = os.fdopen(tmp_fd, "w", encoding=encoding, newline="")
+        except BaseException:
+            os.close(tmp_fd)
+            raise
+        with f:
+            write_fn(f)
+            # flush() errors (ENOSPC, EIO) must propagate: a partial temp
+            # file must not be os.replace'd over a good destination.
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync can legitimately fail on some network filesystems; the
+                # replace below still gives readers an all-or-nothing view.
+                pass
+        retry_on_file_lock(lambda: os.replace(tmp, path))
+    except BaseException:
+        # Do NOT fall back to a direct write -- that is the partial-write path
+        # this helper exists to close. Leave the previous file intact.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` atomically (temp file + ``os.replace``).
+
+    Plain ``open(path, "w")`` truncates the destination and streams into it, so
+    a crash/power loss mid-write leaves a partial file behind. For the UI's
+    raw-text CSV save that means a truncated database. Writing to a unique temp
+    file in the same directory and ``os.replace``-ing it into place gives
+    readers/crashes an all-or-nothing view.
+    """
+    _write_file_atomic(path, lambda f: f.write(text), encoding=encoding)
+
+
+def write_json_atomic(path: str, obj, indent: int = 2) -> None:
+    """Serialize ``obj`` to JSON at ``path`` atomically via streaming ``json.dump``.
+
+    Unlike ``write_text_atomic(json.dumps(obj))``, this never materializes the
+    full serialized string in memory -- important for large scenedata payloads
+    (ratings, tags, cull decisions).
+    """
+    def _dump(f):
+        json.dump(obj, f, indent=indent)
+
+    _write_file_atomic(path, _dump)
+
+
+def save_database(database: pd.DataFrame, db_path: str) -> None:
+    """Save database to CSV, preserving UI-written columns from disk.
+
+    The analysis pipeline only writes BASE_COLUMNS. The UI may have saved
+    user-editable columns (culled, culled_origin) to the same CSV between
+    pipeline saves. This function reads those columns from the existing CSV
+    and merges them back into the pipeline's DataFrame before writing, so
+    user decisions made during analysis are not lost.
+
+    If that read fails, the existing CSV is left unchanged and the error
+    propagates so callers do not treat the save as successful.
+
+    Legacy user columns (rating, scene_name, etc.) are stripped — those now
+    live in kestrel_scenedata.json.
+
+    ``database`` is never mutated. That is load-bearing, not politeness: the
+    merge below is guarded by "this column is absent from the caller's frame",
+    and the merge itself adds the column. Writing into the caller therefore
+    satisfied the guard once and failed it on every later save, so the pipeline
+    kept re-writing the snapshot it captured on its *first* save over whatever
+    the user had marked since. Since the pipeline saves after every image, a
+    second photo culled during a run was erased by the next image's save.
+    """
+    # Copy up front so the merge cannot leak back into the caller. ``drop``
+    # below already returns a copy on the legacy path; doing it here makes both
+    # paths behave the same instead of depending on which columns are present.
+    database = database.copy()
+
+    cols_to_drop = [c for c in LEGACY_USER_COLUMNS if c in database.columns]
+    if cols_to_drop:
+        database = database.drop(columns=cols_to_drop)
+
+    # Preserve UI-written columns from the existing CSV on disk
+    if os.path.exists(db_path):
+        try:
+            # Only read the columns we need to preserve (+ filename for joining)
+            cols_to_read = ["filename"] + [
+                c for c in _UI_PRESERVE_COLUMNS
+            ]
+            disk_df = read_database_csv(
+                db_path,
+                usecols=lambda c: c in cols_to_read,
+                attempts=_SAVE_PRESERVE_READ_ATTEMPTS,
+            )
+            if not disk_df.empty and "filename" in disk_df.columns:
+                for col in _UI_PRESERVE_COLUMNS:
+                    if col in disk_df.columns and col not in database.columns:
+                        # Build a filename→value map from disk
+                        col_map = dict(
+                            zip(disk_df["filename"].astype(str), disk_df[col])
+                        )
+                        database[col] = database["filename"].astype(str).map(col_map)
+        except Exception as e:
+            _warn(
+                f"[database] failed to read UI columns from {db_path} "
+                f"before save; leaving existing CSV unchanged: {e}"
+            )
+            raise
+
+    _to_csv_atomic(database, db_path)

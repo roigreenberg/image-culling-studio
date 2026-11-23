@@ -1,0 +1,66 @@
+# Core ML/AI Dependencies
+# torch, torchvision, tensorflow removed: all ML inference uses ONNX Runtime.
+# onnxruntime on macOS includes CoreMLExecutionProvider for GPU/Neural Engine
+# acceleration via Apple Core ML. No separate package needed (unlike DirectML on Windows).
+# Apple Silicon: 1.28.0 is the first release whose CoreML EP passes the model
+# path when it copies weights stored as external data (MegaDetector mdv5a keeps
+# its weights in mdv5a.onnx.data). 1.23.2 to 1.27.x fail that session with
+# "model_path must not be empty". The 1.28 arm64 wheels need macOS 14.0, so the
+# App Store spec's LSMinimumSystemVersion is 14.0 to match.
+# Intel: PyPI has no macOS x86_64 wheel after 1.23.2, so the Intel build stays
+# there. Intel Macs are deprecated after this release.
+onnxruntime==1.28.0; platform_machine == "arm64"
+onnxruntime==1.23.2; platform_machine == "x86_64"
+
+numpy==2.4.4
+
+# HTTP and SSL dependencies
+certifi
+
+# Computer Vision
+opencv-python==4.11.0.86
+rawpy==0.27.0
+
+# Data Processing
+pandas==2.2.2
+
+# Utilities
+# XMP metadata: pyexiv2 wraps the exiv2 C++ library (bundled in its wheels for
+# Windows/macOS/Linux — no external binary to install). Used to embed XMP
+# ratings/labels directly into JPEG originals in place, without recompressing
+# pixel data, so Adobe Lightroom (which ignores .xmp sidecars for JPEGs) can
+# read them. GPLv3, compatible with Kestrel's AGPLv3.
+pyexiv2==2.15.5
+requests==2.34.2
+pywebview==6.2.1
+keyring
+
+# macOS App Sandbox helpers (security-scoped bookmarks, NSWorkspace) in
+# mac_sandbox.py talk to Cocoa via PyObjC. pywebview's Cocoa backend already
+# pulls these transitively; pinned explicitly so the App Store build can rely
+# on Foundation/AppKit being present and PyInstaller collects them.
+pyobjc-core==12.2.1
+pyobjc-framework-Cocoa==12.2.1
+# ASWebAuthenticationSession (the in-app sign-in sheet) for the Mac App Store
+# build — Apple's Guideline 4 forbids bouncing sign-in to the default browser.
+# Wraps the AuthenticationServices framework; carries the completion-handler
+# block metadata PyObjC needs to call it from Python (see mac_oauth.py). Only
+# the App Store spec bundles it; the direct-download DMG spec excludes it and
+# keeps the loopback flow.
+pyobjc-framework-AuthenticationServices==12.2.1
+# SKStorefront (which App Store storefront the account is on) for the Mac App
+# Store build. Apple's anti-steering rule is storefront-scoped — the US
+# storefront is exempt, everywhere else is not — so the build must ask StoreKit
+# before showing any external purchase link (see mac_storefront.py). Only the
+# App Store spec bundles it; the DMG spec excludes it and never asks.
+pyobjc-framework-StoreKit==12.2.1
+
+# installer
+pyinstaller==6.20.0
+
+# EXIF reading
+exifread
+pillow==13.0.0
+
+# speciesnet, segment-anything-hq, timm removed:
+# pipeline 3.0 no longer uses the SpeciesNet classifier; SAM-HQ runs via ONNX Runtime.

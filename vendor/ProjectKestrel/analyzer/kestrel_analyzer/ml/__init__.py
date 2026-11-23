@@ -1,0 +1,43 @@
+"""ML wrappers; use lazy exports so `import kestrel_analyzer.ml.speciesnet_taxonomy` does not load TensorFlow."""
+
+from __future__ import annotations
+
+import sys
+from typing import Any
+
+__all__ = ["BioClipSpeciesClassifier", "QualityClassifier", "SpeciesNetSAMHQWrapper"]
+
+# Platform-aware GPU execution provider for ONNX Runtime.
+# macOS: CoreMLExecutionProvider (Apple Neural Engine / GPU via Core ML)
+# Windows: DmlExecutionProvider (DirectX 12 GPU via DirectML)
+GPU_EP = "CoreMLExecutionProvider" if sys.platform == "darwin" else "DmlExecutionProvider"
+
+
+def gpu_providers() -> list[str]:
+    """Return ONNX Runtime execution providers list for GPU acceleration on the current platform."""
+    return [GPU_EP, "CPUExecutionProvider"]
+
+
+def is_gpu_active(active_providers: list[str]) -> bool:
+    """Return True if the platform GPU execution provider is active."""
+    if GPU_EP in active_providers:
+        return True
+    # Enhanced GPU mode (Windows only): a vendor EP created from a Windows ML device.
+    from .enhanced_gpu import is_vendor_ep
+    return any(is_vendor_ep(p) for p in active_providers)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "BioClipSpeciesClassifier":
+        from .bioclip_species import BioClipSpeciesClassifier
+
+        return BioClipSpeciesClassifier
+    if name == "QualityClassifier":
+        from .quality import QualityClassifier
+
+        return QualityClassifier
+    if name == "SpeciesNetSAMHQWrapper":
+        from .speciesnet_sam_hq import SpeciesNetSAMHQWrapper
+
+        return SpeciesNetSAMHQWrapper
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
