@@ -574,8 +574,8 @@
     </div>
 
     <div class="video-lang-switch">
-      <button type="button" class="btn" id="btnVidEN">🇺🇸 English Videos</button>
-      <button type="button" class="btn" id="btnVidHE">🇮🇱 סרטונים בעברית</button>
+      <button type="button" class="btn" id="btnVidEN">🎬 English Videos</button>
+      <button type="button" class="btn" id="btnVidHE">🎬 סרטונים בעברית</button>
     </div>
 
     <div class="video-grid">
@@ -1032,7 +1032,7 @@ function toYouTubeEmbedUrl(url) {
   return null;
 }
 
-function loadVideoSlot(frameEl, videoEl, fallbackEl, pathEl, src) {
+function loadVideoSlot(frameEl, videoEl, fallbackEl, pathEl, src, previewSec = 2.5) {
   const existingIframe = frameEl.querySelector("iframe.yt-embed");
   if (existingIframe) existingIframe.remove();
 
@@ -1040,6 +1040,7 @@ function loadVideoSlot(frameEl, videoEl, fallbackEl, pathEl, src) {
   const ytUrl = toYouTubeEmbedUrl(src);
   if (ytUrl) {
     videoEl.pause();
+    videoEl.innerHTML = "";
     videoEl.removeAttribute("src");
     videoEl.style.display = "none";
     const iframe = document.createElement("iframe");
@@ -1055,9 +1056,36 @@ function loadVideoSlot(frameEl, videoEl, fallbackEl, pathEl, src) {
   videoEl.style.display = "block";
   const shortName = (src || "").split("/").pop() || src;
   pathEl.textContent = shortName;
+
+  // Use explicit <source type="video/mp4"> so all browsers decode GitHub Releases MP4s
+  // even when served with Content-Type: application/octet-stream.
+  videoEl.pause();
+  videoEl.removeAttribute("src");
+  videoEl.innerHTML = "";
+  videoEl.dataset.previewPending = "1";
+
+  const source = document.createElement("source");
+  source.src = src;
+  source.type = "video/mp4";
+  source.onerror = () => fallbackEl.classList.add("show");
+  videoEl.appendChild(source);
+
   videoEl.onerror = () => fallbackEl.classList.add("show");
-  videoEl.onloadedmetadata = () => fallbackEl.classList.remove("show");
-  videoEl.src = src;
+  videoEl.onloadedmetadata = () => {
+    fallbackEl.classList.remove("show");
+    // Seek past the opening fade-in so a bright preview frame shows instead of black
+    if (videoEl.dataset.previewPending === "1" && videoEl.duration > previewSec) {
+      try { videoEl.currentTime = previewSec; } catch {}
+    }
+  };
+  videoEl.onplay = () => {
+    if (videoEl.dataset.previewPending === "1") {
+      videoEl.dataset.previewPending = "0";
+      if (Math.abs(videoEl.currentTime - previewSec) < 0.6) {
+        try { videoEl.currentTime = 0; } catch {}
+      }
+    }
+  };
   videoEl.load();
 }
 
@@ -1071,14 +1099,16 @@ function setVideoLanguage(lang) {
     document.getElementById("videoShort"),
     document.getElementById("fallbackShort"),
     document.getElementById("fallbackShortPath"),
-    urls.short
+    urls.short,
+    2.5
   );
   loadVideoSlot(
     document.getElementById("slotDeepFrame"),
     document.getElementById("videoDeep"),
     document.getElementById("fallbackDeep"),
     document.getElementById("fallbackDeepPath"),
-    urls.deep
+    urls.deep,
+    18.0
   );
 }
 
