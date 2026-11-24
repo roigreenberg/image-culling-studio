@@ -1,0 +1,117 @@
+name: Build & Publish Release
+
+# Runs ONLY when you choose to release:
+#   1. Pushing a version tag like v1.0.1 (never on normal commits, never on media-v1)
+#   2. Clicking "Run workflow" manually in the GitHub Actions tab
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark as pre-release (will not trigger stable auto-updates)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Validate version and extract CHANGELOG notes
+        id: meta
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          if not re.match(r"^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.\-]+)?$", version):
+              raise SystemExit(f"Invalid VERSION file content: {version!r}")
+
+          tag = f"v{version}"
+          ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          if ref_type == "tag" and ref_name != tag:
+              raise SystemExit(
+                  f"Tag mismatch: pushed tag is {ref_name!r} but VERSION file is {version!r}. "
+                  f"Update VERSION to {ref_name.lstrip('v')} before tagging."
+              )
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8") if Path("CHANGELOG.md").is_file() else ""
+          pattern = re.compile(
+              rf"^##\s+\[?v?{re.escape(version)}\]?[^\n]*\n(.*?)(?=^##\s+|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          m = pattern.search(changelog)
+          notes = m.group(1).strip() if m else f"ImageCulling Studio {tag}."
+          Path("release_notes.md").write_text(notes + "\n", encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"tag={tag}\n")
+          print(f"Prepared release metadata for {tag}")
+          PY
+
+      - name: Build clean app-only release ZIP
+        run: |
+          python3 scripts/build_release.py --out-dir dist
+          ZIP="dist/ImageCulling-v${{ steps.meta.outputs.version }}.zip"
+          sha256sum "$ZIP" > "${ZIP}.sha256"
+
+      - name: Verify ZIP contains only app runtime files
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          zip_path = Path(f"dist/ImageCulling-v{version}.zip")
+          forbidden = ("/tests/", "/docs/", "/promo_video/", "/scripts/", "/.github/", "/.git", "package.json", "playwright.config.js")
+          with zipfile.ZipFile(zip_path) as zf:
+              names = zf.namelist()
+          bad = [n for n in names if any(tok in n for tok in forbidden)]
+          if bad:
+              raise SystemExit(f"Forbidden non-app files found in release ZIP: {bad}")
+          print(f"Verified {zip_path.name}: {len(names)} clean app files.")
+          PY
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          IS_PRE: ${{ inputs.prerelease || false }}
+        run: |
+          ZIP="dist/ImageCulling-v${VERSION}.zip"
+          SHA="${ZIP}.sha256"
+          PRE_FLAG=""
+          if [ "$IS_PRE" = "true" ] || [[ "$VERSION" == *-* ]]; then
+            PRE_FLAG="--prerelease"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — uploading updated assets and notes..."
+            gh release upload "$TAG" "$ZIP" "$SHA" --clobber
+            gh release edit "$TAG" --notes-file release_notes.md
+          else
+            gh release create "$TAG" "$ZIP" "$SHA" \
+              --title "ImageCulling Studio ${TAG}" \
+              --notes-file release_notes.md \
+              $PRE_FLAG
+          fi
