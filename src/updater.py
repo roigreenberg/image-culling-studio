@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -191,6 +192,23 @@ def _install_updated_deps() -> Tuple[bool, str]:
         return False, str(exc)
 
 
+ALLOWED_DOWNLOAD_HOSTS = frozenset({
+    "github.com",
+    "api.github.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+})
+
+
+def _is_allowed_download_url(url: str) -> bool:
+    """Only allow HTTPS release downloads from official GitHub hosts."""
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in ALLOWED_DOWNLOAD_HOSTS
+
+
 def download_and_apply_update(
     download_url: Optional[str] = None,
     repo: Optional[str] = None,
@@ -226,6 +244,12 @@ def download_and_apply_update(
         download_url = info.get("download_url")
         if not download_url:
             return {"ok": False, "error": "Release has no downloadable ZIP archive."}
+
+    if not _is_allowed_download_url(download_url):
+        return {
+            "ok": False,
+            "error": "Blocked untrusted download URL. Updates may only be downloaded from GitHub HTTPS hosts.",
+        }
 
     req_base_before = _file_sha256(WORKSPACE_ROOT / "requirements-base.txt")
     req_full_before = _file_sha256(WORKSPACE_ROOT / "requirements.txt")
@@ -264,6 +288,7 @@ def download_and_apply_update(
         backup_dir = WORKSPACE_ROOT / ".update_backup" / f"v{prev_version}_{backup_stamp}"
         files_written = 0
 
+        workspace_resolved = WORKSPACE_ROOT.resolve()
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = zf.namelist()
             root_prefix = _strip_common_root(names)
@@ -282,9 +307,9 @@ def download_and_apply_update(
                 if _is_protected(rel):
                     continue
 
-                dest = (WORKSPACE_ROOT / rel).resolve()
-                # Strict ZipSlip containment check
-                if not str(dest).startswith(str(WORKSPACE_ROOT.resolve())):
+                dest = (workspace_resolved / rel).resolve()
+                # Strict ZipSlip containment check (blocks sibling-prefix escapes like ImageCulling_evil)
+                if not dest.is_relative_to(workspace_resolved):
                     continue
 
                 if dest.is_file():

@@ -15,7 +15,7 @@ import numpy as np
 import rawpy
 from PIL import ExifTags, Image
 
-from .config import IMAGE_EXTENSIONS
+from .config import IMAGE_EXTENSIONS, RAW_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,8 @@ def discover_images(source_dir: Path, limit: int = 0) -> List[Tuple[Path, str]]:
     results: List[Tuple[Path, str]] = []
     for p in sorted(source_dir.rglob("*")):
         if not p.is_file():
+            continue
+        if p.name.startswith("."):
             continue
         if p.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
@@ -575,6 +577,121 @@ def parse_jpeg_exif_from_bytes(jpeg_bytes: bytes) -> Dict[str, Any]:
     return meta
 
 
+def parse_raw_exif_from_stream(fh: BinaryIO) -> Dict[str, Any]:
+    """Header-only EXIF & embedded XMP reader for general rawpy-supported RAW formats (NEF, ARW, CR2, DNG, RAF, ORF, RW2, etc.)."""
+    meta: Dict[str, Any] = {
+        "timestamp": None,
+        "timestamp_str": "",
+        "orientation": 1,
+        "focal_length": None,
+        "f_number": None,
+        "exposure_time": "",
+        "exposure_seconds": None,
+        "iso": None,
+        "camera_model": "",
+        "lens_model": "",
+        "camera_rating": 0,
+        "camera_label": "",
+    }
+    try:
+        fh.seek(0)
+        head = fh.read(524288)
+        xmp_idx = head.find(b"<x:xmpmeta")
+        if xmp_idx != -1:
+            xmp_end = head.find(b"</x:xmpmeta>", xmp_idx)
+            xmp_slice = head[xmp_idx : (xmp_end + 12 if xmp_end != -1 else xmp_idx + 16384)]
+            r, lbl = _extract_xmp_rating_label_bytes(xmp_slice)
+            if r is not None:
+                meta["camera_rating"] = r
+            if lbl:
+                meta["camera_label"] = lbl
+    except Exception:
+        pass
+
+    try:
+        import exifread
+
+        fh.seek(0)
+        tags = exifread.process_file(fh, details=False, strict=False)
+        if not tags:
+            return meta
+
+        orient_tag = tags.get("Image Orientation")
+        if orient_tag is not None and getattr(orient_tag, "values", None):
+            try:
+                meta["orientation"] = int(orient_tag.values[0])
+            except Exception:
+                pass
+
+        model_tag = tags.get("Image Model")
+        if model_tag is not None:
+            meta["camera_model"] = str(model_tag).strip()
+
+        lens_tag = tags.get("EXIF LensModel") or tags.get("MakerNote LensModel")
+        if lens_tag is not None:
+            meta["lens_model"] = str(lens_tag).strip()
+
+        dt_tag = (
+            tags.get("EXIF DateTimeOriginal")
+            or tags.get("EXIF DateTimeDigitized")
+            or tags.get("Image DateTime")
+        )
+        sub_tag = tags.get("EXIF SubSecTimeOriginal") or tags.get("EXIF SubSecTimeDigitized")
+        if dt_tag is not None:
+            ts, iso_str = _parse_datetime_with_subsec(str(dt_tag), str(sub_tag) if sub_tag else None)
+            meta["timestamp"] = ts
+            meta["timestamp_str"] = iso_str
+
+        def _tag_float(tag_obj: Any) -> Optional[float]:
+            if tag_obj is None:
+                return None
+            vals = getattr(tag_obj, "values", None)
+            if vals:
+                v = vals[0]
+                if hasattr(v, "num") and hasattr(v, "den") and v.den:
+                    return float(v.num) / float(v.den)
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+            try:
+                return float(str(tag_obj))
+            except Exception:
+                return None
+
+        exp_f = _tag_float(tags.get("EXIF ExposureTime"))
+        if exp_f is not None and exp_f > 0:
+            meta["exposure_time"] = _format_exposure(exp_f)
+            meta["exposure_seconds"] = exp_f
+
+        fn = _tag_float(tags.get("EXIF FNumber"))
+        if fn is not None and fn > 0:
+            meta["f_number"] = round(fn, 2)
+
+        fl = _tag_float(tags.get("EXIF FocalLength"))
+        if fl is not None and fl > 0:
+            meta["focal_length"] = round(fl, 1)
+
+        iso_tag = tags.get("EXIF ISOSpeedRatings") or tags.get("EXIF PhotographicSensitivity")
+        if iso_tag is not None and getattr(iso_tag, "values", None):
+            try:
+                val = iso_tag.values[0]
+                meta["iso"] = int(val)
+            except Exception:
+                pass
+
+        if not meta["camera_rating"]:
+            rating_tag = tags.get("Image Rating")
+            if rating_tag is not None and getattr(rating_tag, "values", None):
+                try:
+                    meta["camera_rating"] = max(0, min(5, int(rating_tag.values[0])))
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.debug("General RAW EXIF parse warning: %s", exc)
+    return meta
+
+
 def read_fast_exif_and_camera_meta(path: Path) -> Dict[str, Any]:
     """Header-only fast metadata reader (no pixel decode) for directory scanning & XMP/EXIF refresh."""
     suffix = path.suffix.lower()
@@ -599,6 +716,9 @@ def read_fast_exif_and_camera_meta(path: Path) -> Dict[str, Any]:
         if suffix == ".cr3":
             with open(path, "rb") as fh:
                 meta.update(parse_cr3_exif_from_stream(fh))
+        elif suffix in RAW_EXTENSIONS:
+            with open(path, "rb") as fh:
+                meta.update(parse_raw_exif_from_stream(fh))
         else:
             with open(path, "rb") as fh:
                 head_bytes = fh.read(262144)
@@ -654,8 +774,8 @@ def _decode_jpeg_fast_bgr(jpeg_bytes: bytes) -> Optional[np.ndarray]:
 
 def load_preview_bgr_and_meta(path: Path) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
     """
-    Strictly read-only loader for .CR3 and .JPG/.JPEG using Python binary file handles
-    (safe for Hebrew/Unicode Windows paths).
+    Strictly read-only loader for rawpy-supported RAWs (.CR3, .NEF, .ARW, .CR2, .DNG, .RAF, .ORF, .RW2, etc.)
+    and .JPG/.JPEG using Python binary file handles (safe for Unicode paths).
     Returns (image_bgr, metadata_dict).
     """
     suffix = path.suffix.lower()
@@ -673,39 +793,59 @@ def load_preview_bgr_and_meta(path: Path) -> Tuple[Optional[np.ndarray], Dict[st
     }
 
     try:
-        if suffix == ".cr3":
+        if suffix in RAW_EXTENSIONS:
+            thumb = None
+            img_bgr: Optional[np.ndarray] = None
             with open(path, "rb") as fh:
-                meta.update(parse_cr3_exif_from_stream(fh))
+                if suffix == ".cr3":
+                    meta.update(parse_cr3_exif_from_stream(fh))
+                else:
+                    meta.update(parse_raw_exif_from_stream(fh))
                 fh.seek(0)
                 with rawpy.imread(fh) as raw:
-                    thumb = raw.extract_thumb()
+                    try:
+                        thumb = raw.extract_thumb()
+                    except Exception:
+                        thumb = None
+                    if thumb is None:
+                        rgb = raw.postprocess(half_size=True, use_camera_wb=True, output_bps=8)
+                        img_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            if thumb.format == rawpy.ThumbFormat.JPEG:
-                thumb_bytes = thumb.data
-                if meta["timestamp"] is None:
-                    thumb_meta = parse_jpeg_exif_from_bytes(thumb_bytes)
-                    if thumb_meta["timestamp"] is not None:
-                        meta["timestamp"] = thumb_meta["timestamp"]
-                        meta["timestamp_str"] = thumb_meta["timestamp_str"]
+            if img_bgr is None and thumb is not None:
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    thumb_bytes = thumb.data
+                    if meta["timestamp"] is None:
+                        thumb_meta = parse_jpeg_exif_from_bytes(thumb_bytes)
+                        if thumb_meta["timestamp"] is not None:
+                            meta["timestamp"] = thumb_meta["timestamp"]
+                            meta["timestamp_str"] = thumb_meta["timestamp_str"]
+                        if meta.get("orientation", 1) == 1 and thumb_meta.get("orientation", 1) != 1:
+                            meta["orientation"] = thumb_meta["orientation"]
 
-                img_bgr = _decode_jpeg_fast_bgr(thumb_bytes)
-                if img_bgr is None:
-                    return None, meta
-                orient = meta.get("orientation", 1)
-                h, w = img_bgr.shape[:2]
-                if orient in (6, 8) and w > h:
-                    img_bgr = apply_orientation_bgr(img_bgr, orient)
-                elif orient == 3:
-                    img_bgr = apply_orientation_bgr(img_bgr, orient)
-            elif thumb.format == rawpy.ThumbFormat.BITMAP:
-                img_bgr = cv2.cvtColor(thumb.data, cv2.COLOR_RGB2BGR)
-                orient = meta.get("orientation", 1)
-                h, w = img_bgr.shape[:2]
-                if orient in (6, 8) and w > h:
-                    img_bgr = apply_orientation_bgr(img_bgr, orient)
-                elif orient == 3:
-                    img_bgr = apply_orientation_bgr(img_bgr, orient)
-            else:
+                    img_bgr = _decode_jpeg_fast_bgr(thumb_bytes)
+                    if img_bgr is None:
+                        return None, meta
+                    orient = meta.get("orientation", 1)
+                    h, w = img_bgr.shape[:2]
+                    if orient in (6, 8) and w > h:
+                        img_bgr = apply_orientation_bgr(img_bgr, orient)
+                    elif orient == 3:
+                        img_bgr = apply_orientation_bgr(img_bgr, orient)
+                elif thumb.format == rawpy.ThumbFormat.BITMAP:
+                    img_bgr = cv2.cvtColor(thumb.data, cv2.COLOR_RGB2BGR)
+                    orient = meta.get("orientation", 1)
+                    h, w = img_bgr.shape[:2]
+                    if orient in (6, 8) and w > h:
+                        img_bgr = apply_orientation_bgr(img_bgr, orient)
+                    elif orient == 3:
+                        img_bgr = apply_orientation_bgr(img_bgr, orient)
+                else:
+                    with open(path, "rb") as fh:
+                        with rawpy.imread(fh) as raw:
+                            rgb = raw.postprocess(half_size=True, use_camera_wb=True, output_bps=8)
+                            img_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+            if img_bgr is None:
                 return None, meta
 
         else:

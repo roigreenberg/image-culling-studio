@@ -26,7 +26,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "rejected": {"enabled": False, "rating": None, "label": ""},
         "to_delete": {"enabled": True, "rating": None, "label": "Red"},
     },
-    "auto_advance_on_rate": True,
+    "auto_advance_on_rate": False,
     "hq_preview_max_dim": 1600,
     "hq_preview_quality": 86,
     "zoom_preview_max_dim": 8192,
@@ -224,6 +224,15 @@ class CullDatabase:
                     key TEXT PRIMARY KEY,
                     value_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS burst_splits (
+                    image_id TEXT PRIMARY KEY,
+                    dir_id TEXT NOT NULL,
+                    orig_burst_id TEXT NOT NULL,
+                    new_burst_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_burst_splits_dir ON burst_splits(dir_id);
                 """
             )
             # Safe schema migration for existing DBs
@@ -315,6 +324,25 @@ class CullDatabase:
                 (ts, level.upper(), category, message, det_str, run_id),
             )
             log_id = cur.lastrowid
+            # Keep event_logs bounded so frequent perf telemetry never grows SQLite indefinitely
+            if log_id and log_id % 100 == 0:
+                conn.execute(
+                    """
+                    DELETE FROM event_logs
+                    WHERE category = 'perf'
+                      AND id NOT IN (
+                          SELECT id FROM event_logs WHERE category = 'perf' ORDER BY id DESC LIMIT 500
+                      )
+                    """
+                )
+                conn.execute(
+                    """
+                    DELETE FROM event_logs
+                    WHERE id NOT IN (
+                        SELECT id FROM event_logs ORDER BY id DESC LIMIT 5000
+                    )
+                    """
+                )
         return {
             "id": log_id,
             "timestamp": ts,
@@ -648,6 +676,8 @@ class CullDatabase:
             f"Imported culling session ({len(rows_to_insert)} images across {len(self.get_directory(dir_id)['subfolders'])} folders) from results.json",
             {"dir_id": dir_id, "count": len(rows_to_insert)},
         )
+        # Re-apply any saved manual burst splits so user splits survive reselect/re-import
+        self.reapply_manual_burst_splits(dir_id)
         return len(rows_to_insert)
 
     # ------------------------------------------------------------------
@@ -860,6 +890,347 @@ class CullDatabase:
                 (dir_id, burst_id),
             ).fetchall()
         return [self._row_to_image(r) for r in rows]
+
+    def get_burst_position_info(self, dir_id: str, burst_id: str, subfolder: str = "") -> Dict[str, int]:
+        """Return 1-based burst position, total bursts, first frame's 1-based image position, and total images."""
+        if not burst_id:
+            return {"burst_pos": 0, "total_bursts": 0, "first_image_pos": 0, "total_images": 0}
+        with self._lock, self._connect() as conn:
+            sub_clause = " AND subfolder = ?" if subfolder else ""
+            sub_params: List[Any] = [dir_id] + ([subfolder] if subfolder else [])
+
+            burst_rows = conn.execute(
+                f"SELECT burst_id FROM images WHERE dir_id = ? AND burst_id != ''{sub_clause} "
+                f"GROUP BY burst_id ORDER BY MIN(timestamp) ASC, burst_id ASC",
+                sub_params,
+            ).fetchall()
+            total_bursts = len(burst_rows)
+            burst_pos = 0
+            for idx, r in enumerate(burst_rows, start=1):
+                if r["burst_id"] == burst_id:
+                    burst_pos = idx
+                    break
+
+            total_images = int(
+                conn.execute(
+                    f"SELECT COUNT(*) AS c FROM images WHERE dir_id = ?{sub_clause}",
+                    sub_params,
+                ).fetchone()["c"]
+            )
+            first_row = conn.execute(
+                f"SELECT timestamp, filename FROM images WHERE dir_id = ? AND burst_id = ?{sub_clause} "
+                f"ORDER BY burst_index ASC, timestamp ASC, filename ASC LIMIT 1",
+                [dir_id, burst_id] + ([subfolder] if subfolder else []),
+            ).fetchone()
+            first_image_pos = 0
+            if first_row:
+                ts = float(first_row["timestamp"] or 0.0)
+                fn = first_row["filename"] or ""
+                before = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) AS c FROM images WHERE dir_id = ?{sub_clause} "
+                        f"AND (COALESCE(timestamp, 0) < ? OR (COALESCE(timestamp, 0) = ? AND filename < ?))",
+                        sub_params + [ts, ts, fn],
+                    ).fetchone()["c"]
+                )
+                first_image_pos = before + 1
+
+        return {
+            "burst_pos": burst_pos,
+            "total_bursts": total_bursts,
+            "first_image_pos": first_image_pos,
+            "total_images": total_images,
+        }
+
+    # ------------------------------------------------------------------
+    # Manual Burst Split / Unsplit (Persisted across Reselect & Re-import)
+    # ------------------------------------------------------------------
+    def _renumber_burst_group(self, conn: sqlite3.Connection, burst_id: str, rows: List[sqlite3.Row]) -> None:
+        size = len(rows)
+        if size == 0:
+            return
+        # Compute burst_rank by overall_score DESC, sharpness_score DESC
+        ranked = sorted(
+            rows,
+            key=lambda r: (float(r["overall_score"] or 0.0), float(r["sharpness_score"] or 0.0)),
+            reverse=True,
+        )
+        rank_by_id = {r["image_id"]: rk for rk, r in enumerate(ranked, start=1)}
+        updates = []
+        for idx, r in enumerate(rows, start=1):
+            updates.append((burst_id, size, idx, rank_by_id[r["image_id"]], r["image_id"]))
+        conn.executemany(
+            "UPDATE images SET burst_id = ?, burst_size = ?, burst_index = ?, burst_rank = ? WHERE image_id = ?",
+            updates,
+        )
+
+    def split_burst_at(self, image_id: str, record_split: bool = True) -> Dict[str, Any]:
+        """Split a burst at `image_id` so `image_id` becomes frame 1/M of a new burst."""
+        with self._lock, self._connect() as conn:
+            target = conn.execute("SELECT * FROM images WHERE image_id = ?", (image_id,)).fetchone()
+            if not target:
+                raise ValueError("Image not found")
+            dir_id = target["dir_id"]
+            orig_bid = target["burst_id"]
+            if not orig_bid:
+                raise ValueError("Image does not belong to a burst")
+
+            members = conn.execute(
+                "SELECT * FROM images WHERE dir_id = ? AND burst_id = ? ORDER BY burst_index ASC, timestamp ASC, filename ASC",
+                (dir_id, orig_bid),
+            ).fetchall()
+            split_idx = next((i for i, r in enumerate(members) if r["image_id"] == image_id), -1)
+            if split_idx <= 0:
+                raise ValueError("Cannot split at the first frame of a burst (must be position > 1)")
+
+            # Generate unique child burst_id (e.g. S0034 -> S0034_2, S0034_3...)
+            base_bid = orig_bid.split("_")[0]
+            existing_bids = {
+                r["burst_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT burst_id FROM images WHERE dir_id = ? AND burst_id LIKE ?",
+                    (dir_id, f"{base_bid}%"),
+                ).fetchall()
+            }
+            suffix = 2
+            while f"{base_bid}_{suffix}" in existing_bids:
+                suffix += 1
+            new_bid = f"{base_bid}_{suffix}"
+
+            left = members[:split_idx]
+            right = members[split_idx:]
+            self._renumber_burst_group(conn, orig_bid, left)
+            self._renumber_burst_group(conn, new_bid, right)
+
+            if record_split:
+                conn.execute(
+                    """
+                    INSERT INTO burst_splits(image_id, dir_id, orig_burst_id, new_burst_id, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(image_id) DO UPDATE SET
+                        orig_burst_id = excluded.orig_burst_id,
+                        new_burst_id = excluded.new_burst_id,
+                        created_at = excluded.created_at
+                    """,
+                    (image_id, dir_id, orig_bid, new_bid, utc_now_iso()),
+                )
+
+        if record_split:
+            self.add_event_log(
+                "INFO",
+                "system",
+                f"Split burst {orig_bid} at {target['filename']} → {orig_bid} ({len(left)}) + {new_bid} ({len(right)})",
+                {"image_id": image_id, "orig_burst_id": orig_bid, "new_burst_id": new_bid},
+            )
+        return {
+            "ok": True,
+            "image_id": image_id,
+            "orig_burst_id": orig_bid,
+            "new_burst_id": new_bid,
+            "left_count": len(left),
+            "right_count": len(right),
+        }
+
+    def unsplit_burst(self, image_id: str) -> Dict[str, Any]:
+        """Merge a previously split burst back into its original burst."""
+        with self._lock, self._connect() as conn:
+            sp = conn.execute("SELECT * FROM burst_splits WHERE image_id = ?", (image_id,)).fetchone()
+            if not sp:
+                raise ValueError("No manual split found at this image")
+            dir_id = sp["dir_id"]
+            orig_bid = sp["orig_burst_id"]
+            new_bid = sp["new_burst_id"]
+
+            combined = conn.execute(
+                "SELECT * FROM images WHERE dir_id = ? AND burst_id IN (?, ?) ORDER BY timestamp ASC, filename ASC",
+                (dir_id, orig_bid, new_bid),
+            ).fetchall()
+            if not combined:
+                raise ValueError("Burst frames not found")
+
+            self._renumber_burst_group(conn, orig_bid, combined)
+            conn.execute("DELETE FROM burst_splits WHERE image_id = ?", (image_id,))
+
+        self.add_event_log(
+            "INFO",
+            "system",
+            f"Merged split burst {new_bid} back into {orig_bid} ({len(combined)} frames)",
+            {"image_id": image_id, "orig_burst_id": orig_bid, "new_burst_id": new_bid},
+        )
+        return {
+            "ok": True,
+            "image_id": image_id,
+            "merged_burst_id": orig_bid,
+            "total_count": len(combined),
+        }
+
+    def list_burst_splits(self, dir_id: str) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM burst_splits WHERE dir_id = ? ORDER BY created_at ASC",
+                (dir_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def reapply_manual_burst_splits(self, dir_id: str) -> int:
+        """Re-apply all saved manual burst split points after a pipeline reselect or re-import."""
+        splits = self.list_burst_splits(dir_id)
+        applied = 0
+        for sp in splits:
+            try:
+                self.split_burst_at(sp["image_id"], record_split=False)
+                applied += 1
+            except Exception:
+                continue
+        return applied
+
+    def query_bursts(
+        self,
+        dir_id: str,
+        subfolder: str = "",
+        track: str = "",
+        species: str = "",
+        scenario_type: str = "",
+        search: str = "",
+        burst_filter: str = "",  # "", "with_picks", "no_picks", "multi_only"
+        use_ai_layer: bool = False,
+        sort_by: str = "timestamp",  # "timestamp", "score", "size"
+        offset: int = 0,
+        limit: int = 40,
+    ) -> Dict[str, Any]:
+        """Return paginated scenario/burst groups with selected items and top runner-ups."""
+        clauses = ["dir_id = ?", "burst_id != ''"]
+        params: List[Any] = [dir_id]
+
+        if subfolder and subfolder != "__all__":
+            clauses.append("subfolder = ?")
+            params.append(subfolder)
+        if track:
+            clauses.append("track = ?")
+            params.append(track)
+        if species:
+            clauses.append("species = ?")
+            params.append(species)
+        if scenario_type:
+            clauses.append("scenario_type = ?")
+            params.append(scenario_type)
+        if search:
+            clauses.append("(filename LIKE ? OR burst_id LIKE ? OR species LIKE ? OR detected_class LIKE ?)")
+            like = f"%{search.strip()}%"
+            params.extend([like, like, like, like])
+
+        where = "WHERE " + " AND ".join(clauses)
+
+        if use_ai_layer:
+            edit_expr = "SUM(CASE WHEN ai_layer = 'layer2_to_edit' THEN 1 ELSE 0 END)"
+            keep_expr = "SUM(CASE WHEN ai_layer = 'layer1_keep' THEN 1 ELSE 0 END)"
+            del_expr = "SUM(CASE WHEN ai_layer = 'to_delete' THEN 1 ELSE 0 END)"
+        else:
+            edit_expr = "SUM(CASE WHEN effective_label = 'Green' THEN 1 ELSE 0 END)"
+            keep_expr = "SUM(CASE WHEN effective_label = 'Yellow' THEN 1 ELSE 0 END)"
+            del_expr = "SUM(CASE WHEN effective_label = 'Red' THEN 1 ELSE 0 END)"
+
+        having = ""
+        if burst_filter == "with_picks":
+            having = f"HAVING ({edit_expr} + {keep_expr}) > 0"
+        elif burst_filter == "no_picks":
+            having = f"HAVING ({edit_expr} + {keep_expr}) = 0"
+        elif burst_filter == "multi_only":
+            having = "HAVING COUNT(*) > 1"
+
+        order_map = {
+            "timestamp": "MIN(timestamp) ASC",
+            "score": "MAX(overall_score) DESC, MIN(timestamp) ASC",
+            "size": "COUNT(*) DESC, MAX(overall_score) DESC",
+        }
+        order_sql = order_map.get(sort_by, "MIN(timestamp) ASC")
+
+        with self._lock, self._connect() as conn:
+            total_sql = f"""
+                SELECT COUNT(*) AS c FROM (
+                    SELECT burst_id FROM images {where} GROUP BY burst_id {having}
+                )
+            """
+            total_bursts = conn.execute(total_sql, params).fetchone()["c"]
+
+            group_sql = f"""
+                SELECT
+                    burst_id,
+                    MIN(subfolder) AS subfolder,
+                    COUNT(*) AS count,
+                    MIN(timestamp) AS start_time,
+                    MIN(timestamp_str) AS start_time_str,
+                    MAX(overall_score) AS max_score,
+                    MAX(sharpness_score) AS max_sharpness,
+                    MAX(track) AS track,
+                    MAX(species) AS species,
+                    MAX(scenario_type) AS scenario_type,
+                    {edit_expr} AS edit_count,
+                    {keep_expr} AS keep_count,
+                    {del_expr} AS delete_count
+                FROM images
+                {where}
+                GROUP BY burst_id
+                {having}
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?
+            """
+            group_rows = conn.execute(group_sql, params + [int(limit), int(offset)]).fetchall()
+
+            burst_ids = [r["burst_id"] for r in group_rows]
+            items_by_burst: Dict[str, List[Dict[str, Any]]] = {bid: [] for bid in burst_ids}
+            if burst_ids:
+                ph = ",".join("?" for _ in burst_ids)
+                img_rows = conn.execute(
+                    f"SELECT * FROM images WHERE dir_id = ? AND burst_id IN ({ph}) ORDER BY burst_index ASC, timestamp ASC",
+                    [dir_id] + burst_ids,
+                ).fetchall()
+                for ir in img_rows:
+                    img = self._row_to_image(ir)
+                    items_by_burst[img["burst_id"]].append(img)
+
+        bursts_out: List[Dict[str, Any]] = []
+        for gr in group_rows:
+            bid = gr["burst_id"]
+            all_imgs = items_by_burst.get(bid, [])
+            if use_ai_layer:
+                sel = [x for x in all_imgs if x["ai_layer"] in ("layer2_to_edit", "layer1_keep")]
+                unsel = [x for x in all_imgs if x["ai_layer"] not in ("layer2_to_edit", "layer1_keep")]
+            else:
+                sel = [x for x in all_imgs if x["effective_label"] in ("Green", "Yellow")]
+                unsel = [x for x in all_imgs if x["effective_label"] not in ("Green", "Yellow")]
+            # Top 3 unselected runner-ups by overall_score/sharpness (useful when a burst has 0 picks)
+            preview_others = sorted(
+                unsel,
+                key=lambda x: (float(x.get("overall_score") or 0.0), float(x.get("sharpness_score") or 0.0)),
+                reverse=True,
+            )[:3]
+            bursts_out.append(
+                {
+                    "burst_id": bid,
+                    "subfolder": gr["subfolder"],
+                    "count": int(gr["count"]),
+                    "start_time": float(gr["start_time"] or 0.0),
+                    "start_time_str": gr["start_time_str"] or "",
+                    "max_score": round(float(gr["max_score"] or 0.0), 1),
+                    "max_sharpness": round(float(gr["max_sharpness"] or 0.0), 1),
+                    "track": gr["track"] or "",
+                    "species": gr["species"] or "",
+                    "scenario_type": gr["scenario_type"] or "",
+                    "edit_count": int(gr["edit_count"] or 0),
+                    "keep_count": int(gr["keep_count"] or 0),
+                    "delete_count": int(gr["delete_count"] or 0),
+                    "selected_items": sel,
+                    "preview_others": preview_others,
+                    "unselected_count": len(unsel),
+                }
+            )
+        return {
+            "total": int(total_bursts),
+            "offset": int(offset),
+            "limit": int(limit),
+            "bursts": bursts_out,
+        }
 
     def get_filter_facets(self, dir_id: str, subfolder: str = "") -> Dict[str, Any]:
         clauses = ["dir_id = ?"]
@@ -1243,7 +1614,8 @@ class CullDatabase:
                     image_id,
                 ),
             )
-            for idx, (fld, old_v, new_v) in enumerate(changes):
+            for fld, old_v, new_v in changes:
+                row_xmp_synced = 1 if (xmp_synced and fld in ("rating", "label")) else 0
                 conn.execute(
                     """
                     INSERT INTO change_log(
@@ -1261,8 +1633,8 @@ class CullDatabase:
                         fld,
                         old_v,
                         new_v,
-                        prev_xmp_xml if idx == 0 else None,
-                        1 if xmp_synced else 0,
+                        prev_xmp_xml if row_xmp_synced else None,
+                        row_xmp_synced,
                         batch_id,
                         img["ai_layer"],
                         float(img.get("overall_score") or 0.0),
@@ -1305,6 +1677,26 @@ class CullDatabase:
             rows = conn.execute(
                 "SELECT * FROM change_log WHERE batch_id = ? AND reverted = 0 ORDER BY id DESC",
                 (batch_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_sibling_unreverted_changes(self, entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return unreverted sibling change_log rows from the exact same edit on the same image."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM change_log
+                WHERE image_id = ? AND timestamp = ? AND action_type = ?
+                  AND batch_id = ? AND reverted = 0 AND id != ?
+                ORDER BY id DESC
+                """,
+                (
+                    entry["image_id"],
+                    entry["timestamp"],
+                    entry["action_type"],
+                    entry.get("batch_id") or "",
+                    entry["id"],
+                ),
             ).fetchall()
         return [dict(r) for r in rows]
 

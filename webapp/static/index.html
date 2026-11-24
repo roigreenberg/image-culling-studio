@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ImageCulling Studio — Fast Wildlife & Bird Culling</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261124b" />
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -19,7 +19,7 @@
           📂 Open Folder
         </button>
         <div class="cull-menu-wrap">
-          <button id="btnRunCullMenu" class="btn btn-accent btn-sm">⚡ Run AI Cull ▾</button>
+          <button id="btnRunCullMenu" class="btn btn-accent btn-sm" title="Run GPU AI culling, fast re-select, pre-generate HQ JPGs, or refresh EXIF/XMP">⚡ Run AI Cull ▾</button>
           <div id="cullDropdown" class="dropdown hidden">
             <button class="dropdown-item" data-cull-mode="unculled">
               <strong>Run Unculled Only</strong>
@@ -71,16 +71,30 @@
       <div class="topbar-right">
         <div class="view-switcher">
           <button class="btn-seg active" data-view="grid" title="Grid View (G)">⊞ Grid</button>
+          <button class="btn-seg" data-view="bursts" title="Burst-by-Burst Review Mode (M)">📚 Bursts</button>
           <button class="btn-seg" data-view="loupe" title="Loupe View (E)">▣ Loupe</button>
-          <button class="btn-seg" data-view="compare" title="Compare Burst / Selected (C)">◫ Compare</button>
+          <button class="btn-seg" data-view="compare" title="Winner vs Challenger Compare (C)">◫ Winner vs Challenger</button>
         </div>
         <button id="btnUndo" class="btn btn-ghost btn-sm" title="Undo last rating/color/XMP change (Ctrl+Z)">↩ Undo</button>
         <button id="btnLogs" class="btn btn-ghost btn-sm" title="Live Logs, Pipeline Runs & Change Restore">📜 Logs &amp; Restore</button>
         <button id="btnLearning" class="btn btn-ghost btn-sm" title="AI vs User Learning Insights">🧠 Insights</button>
         <button id="btnSettings" class="btn btn-ghost btn-sm" title="XMP Sync & Studio Settings">⚙ Settings</button>
-        <button id="btnShortcuts" class="btn btn-ghost btn-sm" title="Keyboard Shortcuts (?)">?</button>
+        <button id="btnShortcuts" class="btn btn-ghost btn-sm" title="User Guide, AI Docs & Keyboard Shortcuts (?)">❓ Help</button>
       </div>
     </header>
+
+    <!-- DISMISSIBLE UPDATE BANNER -->
+    <div id="updateBanner" class="update-banner hidden" role="status">
+      <div class="update-banner-left">
+        <span>🚀</span>
+        <strong id="updateBannerText">Update available</strong>
+      </div>
+      <div class="update-banner-actions">
+        <button id="btnBannerWhatsNew" class="btn btn-xs btn-ghost">View What's New</button>
+        <button id="btnBannerUpdateNow" class="btn btn-xs btn-primary">Update Now</button>
+        <button id="btnBannerDismiss" class="btn btn-xs btn-ghost" title="Dismiss banner">✕</button>
+      </div>
+    </div>
 
     <!-- MAIN BODY -->
     <div class="workspace">
@@ -89,7 +103,7 @@
         <!-- Directory Selector -->
         <div class="side-section">
           <div class="side-title">Workspace Directory</div>
-          <select id="dirSelect" class="select-input"></select>
+          <select id="dirSelect" class="select-input" title="Switch between opened photo directories"></select>
           <div id="dirPathLabel" class="dir-path-label"></div>
         </div>
 
@@ -109,12 +123,12 @@
             </label>
           </div>
           <div id="layerFilters" class="pill-stack">
-            <button class="filter-row active" data-layer=""><span>All Images</span><span class="badge" id="cntAll">0</span></button>
-            <button class="filter-row" data-layer="layer2_to_edit"><span class="dot dot-l2"></span><span>Layer 2 · To Edit</span><span class="badge badge-l2" id="cntL2">0</span></button>
-            <button class="filter-row" data-layer="layer1_all"><span class="dot dot-l1"></span><span>Layer 1 · Keep (All)</span><span class="badge badge-l1" id="cntL1">0</span></button>
-            <button class="filter-row" data-layer="rejected"><span class="dot dot-rej"></span><span>Not Selected</span><span class="badge" id="cntRej">0</span></button>
-            <button class="filter-row" data-layer="to_delete"><span class="dot dot-del"></span><span>To Delete (Bad/Blur)</span><span class="badge badge-del" id="cntDel">0</span></button>
-            <button class="filter-row" data-layer="unculled"><span class="dot dot-unc"></span><span>Unculled</span><span class="badge" id="cntUnc">0</span></button>
+            <button class="filter-row active" data-layer="" title="Show all images in the active folder"><span>All Images</span><span class="badge" id="cntAll">0</span></button>
+            <button class="filter-row" data-layer="layer2_to_edit" title="Hero / Portfolio picks (Live mode: Green label · AI mode: Layer 2)"><span class="dot dot-l2"></span><span>Layer 2 · To Edit</span><span class="badge badge-l2" id="cntL2">0</span></button>
+            <button class="filter-row" data-layer="layer1_all" title="All keepers to retain (Live mode: Green + Yellow labels · AI mode: Layer 1 + 2)"><span class="dot dot-l1"></span><span>Layer 1 · Keep (All)</span><span class="badge badge-l1" id="cntL1">0</span></button>
+            <button class="filter-row" data-layer="rejected" title="Usable runner-ups not promoted to Keep/Edit (Live mode: No color label)"><span class="dot dot-rej"></span><span>Not Selected</span><span class="badge" id="cntRej">0</span></button>
+            <button class="filter-row" data-layer="to_delete" title="Blurry, misfocused, or empty frames flagged for deletion (Live mode: Red label)"><span class="dot dot-del"></span><span>To Delete (Bad/Blur)</span><span class="badge badge-del" id="cntDel">0</span></button>
+            <button class="filter-row" data-layer="unculled" title="Photos that have not been scored by the AI pipeline yet"><span class="dot dot-unc"></span><span>Unculled</span><span class="badge" id="cntUnc">0</span></button>
           </div>
         </div>
 
@@ -169,14 +183,14 @@
             <button class="rf-btn" data-track="Landscape" title="Sun / Landscape">🌅 <span id="cntTrkLand">0</span></button>
             <button class="rf-btn" data-track="Other" title="Other">Other</button>
           </div>
-          <select id="speciesFilter" class="select-input sm" style="margin-top:6px"><option value="">All Species (BioCLIP 2)</option></select>
-          <select id="scenarioFilter" class="select-input sm" style="margin-top:6px">
+          <select id="speciesFilter" class="select-input sm" style="margin-top:6px" title="Filter by wildlife/bird species identified by BioCLIP 2"><option value="">All Species (BioCLIP 2)</option></select>
+          <select id="scenarioFilter" class="select-input sm" style="margin-top:6px" title="Filter by burst type: Action Sequence (flight/motion), Static Group, or Single Shot">
             <option value="">All Scenarios</option>
             <option value="action_sequence">🎬 Action Sequence</option>
             <option value="static_group">📸 Static Group</option>
             <option value="single">1️⃣ Single Shot</option>
           </select>
-          <label class="checkbox-row" style="margin-top:6px">
+          <label class="checkbox-row" style="margin-top:6px" title="Show only wildlife shots that received the +15% golden-hour / sunrise / sunset light bonus">
             <input type="checkbox" id="chkHybridOnly" />
             <span>✨ Golden / Hybrid Light (<span id="cntHybrid">0</span>)</span>
           </label>
@@ -185,9 +199,9 @@
         <!-- Camera & Lens Facets -->
         <div class="side-section">
           <div class="side-title">EXIF Gear</div>
-          <select id="cameraFilter" class="select-input sm"><option value="">All Cameras</option></select>
-          <select id="lensFilter" class="select-input sm" style="margin-top:6px"><option value="">All Lenses</option></select>
-          <label class="checkbox-row" style="margin-top:8px">
+          <select id="cameraFilter" class="select-input sm" title="Filter by camera body from EXIF metadata"><option value="">All Cameras</option></select>
+          <select id="lensFilter" class="select-input sm" style="margin-top:6px" title="Filter by lens model from EXIF metadata"><option value="">All Lenses</option></select>
+          <label class="checkbox-row" style="margin-top:8px" title="Show only the #1 highest-scoring frame from each burst/scenario">
             <input type="checkbox" id="chkBurstBest" />
             <span>Only #1 sharpest per burst</span>
           </label>
@@ -202,26 +216,26 @@
             <span id="resultCount" class="result-count">0 images</span>
             <input id="searchInput" type="search" class="search-input" placeholder="Search filename, burst, bird, lens..." />
             <label class="checkbox-row compact" title="Automatically jump to next photo after pressing 0-5 or color key">
-              <input type="checkbox" id="chkAutoAdvance" checked />
+              <input type="checkbox" id="chkAutoAdvance" />
               <span>Auto-Advance</span>
             </label>
           </div>
           <div class="toolbar-right">
             <div id="batchBar" class="batch-bar hidden">
               <span id="batchCount">0 selected</span>
-              <button class="btn btn-xs" data-batch-rate="5">5★</button>
-              <button class="btn btn-xs" data-batch-rate="4">4★</button>
-              <button class="btn btn-xs" data-batch-rate="3">3★</button>
-              <button class="btn btn-xs" data-batch-rate="0">0★</button>
-              <button class="btn btn-xs" data-batch-label="Green">🟢</button>
-              <button class="btn btn-xs" data-batch-label="Yellow">🟡</button>
-              <button class="btn btn-xs" data-batch-label="Red">🔴</button>
-              <button class="btn btn-xs btn-accent" id="btnBatchCull">⚡ Cull Selected</button>
-              <button class="btn btn-xs btn-ghost" id="btnClearSel">Clear</button>
+              <button class="btn btn-xs" data-batch-rate="5" title="Set 5 stars on all selected photos">5★</button>
+              <button class="btn btn-xs" data-batch-rate="4" title="Set 4 stars on all selected photos">4★</button>
+              <button class="btn btn-xs" data-batch-rate="3" title="Set 3 stars on all selected photos">3★</button>
+              <button class="btn btn-xs" data-batch-rate="0" title="Clear star rating on all selected photos">0★</button>
+              <button class="btn btn-xs" data-batch-label="Green" title="Mark selected as Green (Edit)">🟢</button>
+              <button class="btn btn-xs" data-batch-label="Yellow" title="Mark selected as Yellow (Keep)">🟡</button>
+              <button class="btn btn-xs" data-batch-label="Red" title="Mark selected as Red (To Delete)">🔴</button>
+              <button class="btn btn-xs btn-accent" id="btnBatchCull" title="Re-run GPU AI culling only on the selected photos">⚡ Cull Selected</button>
+              <button class="btn btn-xs btn-ghost" id="btnClearSel" title="Clear multi-selection">Clear</button>
             </div>
-            <label class="sort-wrap">
+            <label class="sort-wrap" title="Sort images in Grid and Loupe roll">
               <span>Sort:</span>
-              <select id="sortSelect" class="select-input xs">
+              <select id="sortSelect" class="select-input xs" title="Choose sort order for Grid & Loupe">
                 <option value="overall_rank:asc">AI Overall Rank</option>
                 <option value="overall_score:desc">AI Overall Score</option>
                 <option value="personal:desc">Personal Ranker Score</option>
@@ -242,9 +256,63 @@
 
         <!-- GRID VIEW -->
         <section id="gridView" class="grid-view">
+          <div id="welcomeCard" class="welcome-card hidden">
+            <div class="welcome-icon">🦅</div>
+            <h2>Welcome to ImageCulling Studio</h2>
+            <p class="welcome-sub">Fast, local AI-powered RAW &amp; JPEG culling with safe Lightroom &amp; Photo Mechanic XMP sync. Your original photo files are never modified.</p>
+            <button id="btnWelcomeOpenDir" class="btn btn-primary btn-lg">📂 Open Photo Folder</button>
+            <div class="welcome-steps">
+              <div class="welcome-step">
+                <span class="step-num">1</span>
+                <div>
+                  <strong>Open a Folder</strong>
+                  <p>Select any folder of RAW (<code>.CR3</code>, <code>.NEF</code>, <code>.ARW</code>, <code>.DNG</code>, etc.) or <code>.JPG</code> images. Subfolders appear automatically in the sidebar.</p>
+                </div>
+              </div>
+              <div class="welcome-step">
+                <span class="step-num">2</span>
+                <div>
+                  <strong>Run AI Cull</strong>
+                  <p>Click <strong>⚡ Run AI Cull ▾ → Run Unculled Only</strong> to score wildlife &amp; landscapes and group bursts.</p>
+                </div>
+              </div>
+              <div class="welcome-step">
+                <span class="step-num">3</span>
+                <div>
+                  <strong>Review &amp; Sync</strong>
+                  <p>Inspect full-res (<kbd>E</kbd>), compare <strong>Winner vs. Challenger</strong> (<kbd>C</kbd>), rate (<kbd>0</kbd>–<kbd>5</kbd>) or color-label (<kbd>6</kbd>–<kbd>9</kbd>, <kbd>P</kbd>), and sync live to <code>.xmp</code> sidecars.</p>
+                </div>
+              </div>
+            </div>
+          </div>
           <div id="photoGrid" class="photo-grid"></div>
           <div id="loadMoreWrap" class="load-more-wrap hidden">
             <button id="btnLoadMore" class="btn btn-ghost">Load More Images</button>
+          </div>
+        </section>
+
+        <!-- BURST-BY-BURST REVIEW VIEW (#1) -->
+        <section id="burstsView" class="bursts-view hidden">
+          <div class="bursts-topbar">
+            <div class="bursts-topbar-left">
+              <strong id="burstsCountLabel">0 bursts</strong>
+              <div class="rating-op-group" id="burstFilterBar">
+                <button class="rop-btn active" data-bf="" title="Show all bursts and single-frame photos">All Bursts</button>
+                <button class="rop-btn" data-bf="with_picks" title="Show only bursts containing at least one Green or Yellow pick">Has Picks</button>
+                <button class="rop-btn" data-bf="no_picks" title="Audit bursts with zero picks so you never miss a hidden gem">0 Picks (Audit)</button>
+                <button class="rop-btn" data-bf="multi_only" title="Show only bursts with 2 or more frames (hides single shots)">Multi-Frame</button>
+              </div>
+              <select id="burstSortSelect" class="select-input xs" title="Sort order for Burst Rows and Winner vs. Challenger navigation">
+                <option value="timestamp">Order: Chronological</option>
+                <option value="score">Order: Highest AI Score</option>
+                <option value="size">Order: Largest Burst</option>
+              </select>
+            </div>
+            <span class="muted">↑/↓ jump bursts · Space expand · Enter Winner vs Challenger · 6/7/8/0 color</span>
+          </div>
+          <div id="burstsList" class="bursts-list"></div>
+          <div id="burstsLoadMoreWrap" class="load-more-wrap hidden">
+            <button id="btnLoadMoreBursts" class="btn btn-ghost">Load More Bursts</button>
           </div>
         </section>
 
@@ -261,6 +329,7 @@
 
               <!-- Floating Loupe HUD -->
               <div class="loupe-hud-top">
+                <span id="loupeCounter" class="hud-chip strong">0 / 0</span>
                 <span id="loupeFilename" class="hud-chip strong"></span>
                 <span id="loupeLayerPill" class="hud-chip"></span>
                 <span id="loupeSpeedPill" class="hud-chip"></span>
@@ -274,10 +343,12 @@
                   <span id="resQualityBadge" class="zp-res" title="Current image resolution">HQ</span>
                 </div>
                 <button id="btnJumpFocus" class="hud-btn" title="Center zoom on camera AF focus point (A)">⊕ Focus (A)</button>
-                <button id="btnHoldFull" class="hud-btn" title="Hold button or hold Q key to peek at full 45MP image">🔬 Hold 45MP (Q)</button>
+                <button id="btnHoldFull" class="hud-btn" title="Hold button or hold Q key to peek at full-resolution image">🔬 Hold Full-Res (Q)</button>
                 <button id="btnToggleAf" class="hud-btn active" title="Show/hide camera AF focus area (F)">🎯 AF (F)</button>
                 <button id="btnToggleHighlights" class="hud-btn active" title="Toggle gentle burned highlights zebra overlay (H)">☀ Highlights (H)</button>
                 <button id="btnToggleBbox" class="hud-btn" title="Toggle YOLO Subject & Head Box (B)">📦 AI Box (B)</button>
+                <button id="btnLoupeSplitBurst" class="hud-btn hidden" title="Split burst starting at this image (S)">✂ Split Burst (S)</button>
+                <button id="btnLoupeUnsplitBurst" class="hud-btn hidden" title="Merge this split burst back into the previous burst">🔗 Merge Back</button>
                 <button id="btnLoupeCompareBurst" class="hud-btn" title="Compare this burst side-by-side (C)">◫ Burst</button>
               </div>
 
@@ -287,8 +358,8 @@
                 <div class="hud-sep"></div>
                 <div class="color-picker" id="loupeColors"></div>
                 <div class="hud-sep"></div>
-                <button id="btnFlagPick" class="hud-btn" title="Pick (P/F)">🏳 Pick</button>
-                <button id="btnFlagReject" class="hud-btn" title="Reject (X)">✕ Reject</button>
+                <button id="btnFlagPick" class="hud-btn" title="Mark as Pick (U to clear flag)">🏳 Pick</button>
+                <button id="btnFlagReject" class="hud-btn" title="Reject (X · U to clear)">✕ Reject</button>
                 <span id="loupeXmpStatus" class="xmp-pill">XMP</span>
               </div>
             </div>
@@ -334,16 +405,70 @@
           </div>
         </section>
 
-        <!-- COMPARE VIEW -->
+        <!-- WINNER VS CHALLENGER COMPARE VIEW (#2) -->
         <section id="compareView" class="compare-view hidden">
           <div class="compare-header">
-            <span id="compareTitle">Side-by-Side Compare</span>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <strong id="compareTitle">Winner vs. Challenger</strong>
+              <span id="compareBurstCounter" class="hud-chip strong" title="Current burst position out of total bursts (includes single photos unless Multi-Frame filter is active)">Burst 0 / 0</span>
+              <span id="compareImageCounter" class="hud-chip strong" title="Current Challenger photo position out of total filtered/directory images">Image 0 / 0</span>
+              <span id="compareDeltaBadge" class="hud-chip" title="Sharpness difference between Challenger (right) and Pinned Winner (left)"></span>
+            </div>
             <div class="compare-actions">
-              <button id="btnCompareToggleCrop" class="btn btn-sm btn-ghost">🔍 Toggle Head Crops</button>
-              <button id="btnCompareExit" class="btn btn-sm btn-ghost">✕ Back to Grid</button>
+              <button id="btnWvcPrevBurst" class="btn btn-sm btn-ghost" title="Previous Burst (↑)">↑ Prev Burst</button>
+              <button id="btnWvcNextBurst" class="btn btn-sm btn-ghost" title="Next Burst (↓)">↓ Next Burst</button>
+              <button id="btnWvcZoomToggle" class="btn btn-sm btn-ghost" title="Toggle Synced 100% Focus Zoom (Z)">🔍 Synced Zoom (Z)</button>
+              <button id="btnWvcSwap" class="btn btn-sm btn-primary" title="Swap: promote Challenger to Winner's color & demote old Winner (S)">⇄ Swap Winner (S)</button>
+              <button id="btnWvcKeepBoth" class="btn btn-sm btn-accent" title="Keep Both: give Challenger the Winner's color too (K)">✚ Keep Both (K)</button>
+              <button id="btnCompareExit" class="btn btn-sm btn-ghost">✕ Back</button>
             </div>
           </div>
-          <div id="compareGrid" class="compare-grid"></div>
+
+          <div class="wvc-split">
+            <!-- LEFT: PINNED WINNER -->
+            <div class="wvc-pane" id="wvcLeftPane">
+              <div class="wvc-pane-head">
+                <span class="wvc-role winner">👑 PINNED WINNER</span>
+                <span id="wvcWinName" class="wvc-fname"></span>
+                <span id="wvcWinMeta" class="muted"></span>
+              </div>
+              <div class="wvc-stage" id="wvcLeftStage">
+                <div class="wvc-img-wrap" id="wvcLeftWrap">
+                  <img id="wvcWinImg" alt="Winner" draggable="false" />
+                </div>
+              </div>
+              <div class="wvc-pane-foot" id="wvcWinControls"></div>
+            </div>
+
+            <!-- RIGHT: CHALLENGER -->
+            <div class="wvc-pane" id="wvcRightPane">
+              <div class="wvc-pane-head">
+                <span class="wvc-role challenger">⚔ CHALLENGER</span>
+                <span id="wvcChalName" class="wvc-fname"></span>
+                <span id="wvcChalMeta" class="muted"></span>
+                <button id="btnWvcPinChallenger" class="btn btn-xs btn-ghost" title="Pin this Challenger on the left as the new reference">📌 Pin Left</button>
+                <button id="btnWvcSplitHere" class="btn btn-xs btn-ghost hidden" title="Split burst starting at this Challenger frame">✂ Split Here</button>
+                <button id="btnWvcUnsplitHere" class="btn btn-xs btn-ghost hidden" title="Merge this split burst back into the previous burst">🔗 Merge Back</button>
+              </div>
+              <div class="wvc-stage" id="wvcRightStage">
+                <button id="btnWvcChalPrev" class="loupe-nav prev" title="Previous frame in burst (←)">‹</button>
+                <div class="wvc-img-wrap" id="wvcRightWrap">
+                  <img id="wvcChalImg" alt="Challenger" draggable="false" />
+                </div>
+                <button id="btnWvcChalNext" class="loupe-nav next" title="Next frame in burst (→)">›</button>
+              </div>
+              <div class="wvc-pane-foot" id="wvcChalControls"></div>
+            </div>
+          </div>
+
+          <!-- COLOR-CODED BURST FILMSTRIP -->
+          <div class="filmstrip-bar">
+            <div class="filmstrip-header">
+              <span id="wvcStripInfo">Burst Frames (Green = Edit · Yellow = Keep · Red = Delete)</span>
+              <span id="wvcStripPos" class="muted">0 / 0</span>
+            </div>
+            <div id="wvcFilmstrip" class="filmstrip-scroll"></div>
+          </div>
         </section>
       </main>
     </div>
@@ -357,7 +482,7 @@
         <button class="modal-close" data-close="modalOpenDir">✕</button>
       </div>
       <div class="modal-body">
-        <p class="muted">Choose a folder containing CR3 / JPG images (subfolders will each appear separately in the sidebar).</p>
+        <p class="muted">Choose a folder containing RAW / JPG images (subfolders will each appear separately in the sidebar).</p>
         <div class="input-row">
           <input id="inputDirPath" type="text" class="text-input" placeholder="D:\Photos\Wildlife" />
           <button id="btnNativeBrowse" class="btn btn-ghost">Browse...</button>
@@ -414,13 +539,13 @@
               <tr>
                 <td><span class="dot dot-l2"></span> Layer 2 (To Edit)</td>
                 <td><input type="checkbox" id="mapL2Enabled" /></td>
-                <td><select id="mapL2Rating" class="select-input xs"><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
+                <td><select id="mapL2Rating" class="select-input xs"><option value="">Keep</option><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
                 <td><select id="mapL2Label" class="select-input xs"><option value="">None</option><option value="Red">Red</option><option value="Yellow">Yellow</option><option value="Green">Green</option><option value="Blue">Blue</option><option value="Purple">Purple</option></select></td>
               </tr>
               <tr>
                 <td><span class="dot dot-l1"></span> Layer 1 (Keep)</td>
                 <td><input type="checkbox" id="mapL1Enabled" /></td>
-                <td><select id="mapL1Rating" class="select-input xs"><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
+                <td><select id="mapL1Rating" class="select-input xs"><option value="">Keep</option><option value="0">0★</option><option value="1">1★</option><option value="2">2★</option><option value="3">3★</option><option value="4">4★</option><option value="5">5★</option></select></td>
                 <td><select id="mapL1Label" class="select-input xs"><option value="">None</option><option value="Red">Red</option><option value="Yellow">Yellow</option><option value="Green">Green</option><option value="Blue">Blue</option><option value="Purple">Purple</option></select></td>
               </tr>
               <tr>
@@ -454,13 +579,30 @@
           <div class="inline-fields" style="margin-top:6px">
             <label>Zoom Preview Size:
               <select id="setZoomDim" class="select-input xs">
-                <option value="8192">8192px (Full 45MP · Sharpest · Zero Re-encode)</option>
+                <option value="8192">Original / Up to 8192px (Full-Res · Sharpest · Zero Re-encode)</option>
                 <option value="4096">4096px (11MP Medium)</option>
                 <option value="3072">3072px (6MP Light)</option>
               </select>
             </label>
             <label>Zoom Quality: <input id="setZoomQuality" type="number" min="70" max="96" class="text-input xs" /></label>
           </div>
+        </div>
+
+        <div class="settings-group" id="settingsUpdateSection">
+          <h4>🚀 Version &amp; Updates</h4>
+          <div class="update-meta-row">
+            <span>Current Version: <strong id="setCurrentVersion">v—</strong></span>
+            <a id="setReleasesLink" href="https://github.com/roigreenberg/image-culling-studio/releases" target="_blank" rel="noopener noreferrer" class="link-accent">GitHub Releases ↗</a>
+          </div>
+          <div class="sync-action-row" style="margin-top:8px">
+            <button id="btnCheckUpdates" class="btn btn-ghost btn-sm" title="Check GitHub Releases for a newer version">🔄 Check for Updates</button>
+            <button id="btnInstallUpdate" class="btn btn-primary btn-sm" disabled title="Download and apply the latest release safely (never touches photos, DB, models, or .env)">⬇ Install Update</button>
+            <span id="updateStatusMsg" class="muted"></span>
+          </div>
+          <details id="setChangelogDetails" class="changelog-details">
+            <summary id="setChangelogSummary">What's New / Changelog</summary>
+            <pre id="setChangelogBody" class="changelog-box">Loading changelog...</pre>
+          </details>
         </div>
       </div>
       <div class="modal-footer">
@@ -523,28 +665,102 @@
     </div>
   </div>
 
-  <!-- SHORTCUTS MODAL -->
+  <!-- HELP & SHORTCUTS MODAL -->
   <div id="modalShortcuts" class="modal-backdrop hidden">
-    <div class="modal-card">
+    <div class="modal-card wide">
       <div class="modal-header">
-        <h3>⌨️ Super-Fast Keyboard Shortcuts</h3>
+        <h3>❓ ImageCulling Studio — Help &amp; Shortcuts</h3>
         <button class="modal-close" data-close="modalShortcuts">✕</button>
       </div>
+      <div class="modal-tabs" id="helpModalTabs">
+        <button class="m-tab active" data-help-tab="guide">📖 Quick Guide</button>
+        <button class="m-tab" data-help-tab="shortcuts">⌨️ Keyboard Shortcuts</button>
+        <button class="m-tab" data-help-tab="ai">🧠 AI Scores &amp; XMP</button>
+      </div>
       <div class="modal-body">
-        <div class="shortcut-grid">
-          <div><kbd>0</kbd>–<kbd>5</kbd></div><div>Set Star Rating (writes XMP live)</div>
-          <div><kbd>6</kbd> <kbd>7</kbd> <kbd>8</kbd> <kbd>9</kbd> <kbd>P</kbd></div><div>Color Label: Red / Yellow / Green / Blue / Purple</div>
-          <div><kbd>←</kbd> / <kbd>→</kbd></div><div>Previous / Next image</div>
-          <div><kbd>G</kbd> / <kbd>E</kbd> / <kbd>C</kbd></div><div>Grid / Loupe / Compare view</div>
-          <div><kbd>Z</kbd> or <kbd>Space</kbd></div><div>Toggle Fit ↔ 100% Zoom (at AF Focus point)</div>
-          <div><kbd>Ctrl</kbd>+<kbd>+</kbd>/<kbd>-</kbd>/<kbd>0</kbd></div><div>Zoom In / Zoom Out / Fit (or Mouse Wheel)</div>
-          <div><kbd>Drag</kbd></div><div>Pan zoomed photo (←/→ keeps zoom position!)</div>
-          <div><kbd>A</kbd></div><div>Jump zoomed view to camera AF Focus point</div>
-          <div><kbd>Hold Q</kbd></div><div>Peek at full 45MP image while holding Q</div>
-          <div><kbd>F</kbd> / <kbd>H</kbd> / <kbd>B</kbd></div><div>Toggle Camera AF Box / Burned Highlights / YOLO AI Box</div>
-          <div><kbd>X</kbd> / <kbd>U</kbd></div><div>Reject flag / Clear flag</div>
-          <div><kbd>Ctrl+Z</kbd></div><div>Undo last rating / color / XMP change</div>
-          <div><kbd>Esc</kbd></div><div>Exit Loupe / Close modal / Clear selection</div>
+        <!-- TAB 1: QUICK GUIDE -->
+        <div id="helpTabGuide" class="help-tab-panel">
+          <div class="help-section">
+            <h4>4 Culling Views</h4>
+            <div class="help-grid">
+              <div class="help-card">
+                <strong>⊞ Grid (<kbd>G</kbd>)</strong>
+                <p>Browse your filtered shoot at high speed. Check multiple cards for batch rating/labeling, or click any photo to open Loupe.</p>
+              </div>
+              <div class="help-card">
+                <strong>📚 Burst Rows (<kbd>M</kbd>)</strong>
+                <p>Review chronologically one burst/scenario per row. Press <kbd>Space</kbd> to expand all frames inline, or <kbd>Enter</kbd> to open Winner vs. Challenger.</p>
+              </div>
+              <div class="help-card">
+                <strong>▣ Loupe (<kbd>E</kbd>)</strong>
+                <p>Inspect single frames at full camera resolution. Use <kbd>Z</kbd> for AF focus zoom, <kbd>F</kbd> for AF focus box, <kbd>H</kbd> for burned highlights, and hold <kbd>Q</kbd> to peek full resolution.</p>
+              </div>
+              <div class="help-card">
+                <strong>◫ Winner vs. Challenger (<kbd>C</kbd>)</strong>
+                <p>Pinned Winner stays on the left while you step Challengers (<kbd>←</kbd>/<kbd>→</kbd>) on the right with synced zoom &amp; drag pan. Press <kbd>S</kbd> to Swap Winner, <kbd>K</kbd> to Keep Both, and <kbd>↑</kbd>/<kbd>↓</kbd> to jump bursts (including single photos).</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="help-section">
+            <h4>Color Labels &amp; Layer Workflow</h4>
+            <p class="muted" style="margin-bottom:8px">By default, sidebar buckets reflect your <strong>live color labels</strong> (check <strong>AI</strong> next to <em>Culling Layer</em> to inspect original AI assignments):</p>
+            <div class="help-color-row">
+              <span><kbd>8</kbd> 🟢 <strong>Green</strong> = Layer 2 · To Edit</span>
+              <span><kbd>7</kbd> 🟡 <strong>Yellow</strong> = Layer 1 · Keep</span>
+              <span><kbd>6</kbd> 🔴 <strong>Red</strong> = To Delete (Bad/Blur)</span>
+              <span><kbd>9</kbd> 🔵 Blue · <kbd>P</kbd> 🟣 Purple</span>
+              <span><em>Press same key again to clear color (Not Selected)</em></span>
+            </div>
+          </div>
+
+          <div class="help-tip">
+            <strong>💡 Browser Extension Tip (Vimium / Surfingkeys):</strong> If single-key shortcuts like <kbd>0</kbd>–<kbd>9</kbd> only work with <kbd>Shift</kbd>, add <code>http://127.0.0.1:8765/*</code> to your extension's Excluded URLs.
+          </div>
+        </div>
+
+        <!-- TAB 2: KEYBOARD SHORTCUTS -->
+        <div id="helpTabShortcuts" class="help-tab-panel hidden">
+          <p class="muted" style="margin-bottom:10px">All shortcuts work in lowercase, uppercase, CapsLock, Hebrew layout, top number row, and Numpad.</p>
+          <div class="shortcut-grid">
+            <div><kbd>0</kbd>–<kbd>5</kbd></div><div>Set Star Rating (writes XMP live if enabled)</div>
+            <div><kbd>6</kbd> <kbd>7</kbd> <kbd>8</kbd> <kbd>9</kbd> <kbd>P</kbd></div><div>Toggle Color Label: Red / Yellow / Green / Blue / Purple</div>
+            <div><kbd>←</kbd> / <kbd>→</kbd></div><div>Previous / Next image (Loupe/Grid) or Challenger (Winner vs Challenger)</div>
+            <div><kbd>G</kbd> / <kbd>M</kbd> / <kbd>E</kbd> / <kbd>C</kbd></div><div>Switch view: Grid / Burst Rows / Loupe / Winner vs Challenger</div>
+            <div><kbd>↑</kbd> / <kbd>↓</kbd></div><div>Previous / Next Burst (in Burst Rows or Winner vs Challenger)</div>
+            <div><kbd>S</kbd> / <kbd>K</kbd></div><div>Loupe: Split Burst (S) · Winner vs Challenger: Swap Winner (S) / Keep Both (K)</div>
+            <div><kbd>Z</kbd> or <kbd>Space</kbd></div><div>Toggle Fit ↔ 100% Zoom (centered on camera AF Focus point)</div>
+            <div><kbd>Ctrl</kbd>+<kbd>+</kbd>/<kbd>-</kbd>/<kbd>0</kbd></div><div>Zoom In / Zoom Out / Fit (or Mouse Wheel)</div>
+            <div><kbd>Drag</kbd></div><div>Pan zoomed photo (synced on both sides in Winner vs Challenger)</div>
+            <div><kbd>A</kbd></div><div>Jump zoomed view to camera AF Focus point (Loupe)</div>
+            <div><kbd>Hold Q</kbd></div><div>Peek at full-resolution image while holding Q</div>
+            <div><kbd>F</kbd> / <kbd>H</kbd> / <kbd>B</kbd></div><div>Toggle Camera AF Box / Burned Highlights / AI Detection Box</div>
+            <div><kbd>X</kbd> / <kbd>U</kbd></div><div>Reject flag / Clear flag</div>
+            <div><kbd>Ctrl+Z</kbd></div><div>Undo last rating / color / XMP change</div>
+            <div><kbd>?</kbd> / <kbd>Esc</kbd></div><div>Open Help &amp; Shortcuts / Close modal or exit view</div>
+          </div>
+        </div>
+
+        <!-- TAB 3: AI SCORES & XMP -->
+        <div id="helpTabAi" class="help-tab-panel hidden">
+          <div class="help-section">
+            <h4>How AI Culling Scores Your Shoot</h4>
+            <ul class="help-list">
+              <li><strong>Project Kestrel Core:</strong> MegaDetector + SAM-HQ segments the wildlife subject, BioCLIP 2 identifies bird/animal species, and segmented sharpness scores subject/head focus independently of background bokeh.</li>
+              <li><strong>SigLIP 2 Visual Scoring:</strong> Evaluates wildlife action/pose, eye catchlight, eye contact, occlusion, and golden-hour / sunrise / sunset landscape quality.</li>
+              <li><strong>Two-Track Routing + Hybrid Light:</strong> Routes photos into <em>Wildlife</em> or <em>Landscape</em>, awarding a <strong>+15% Hybrid Light bonus</strong> when wildlife is photographed in dramatic sunrise/sunset light.</li>
+              <li><strong>Manual Burst Split &amp; Merge:</strong> Split a burst at any frame (<kbd>S</kbd> in Loupe or <em>✂ Split Here</em> in Winner vs. Challenger). Splits are persisted in SQLite and automatically reapplied across fast re-selects.</li>
+              <li><strong>Personal Ranker (🧠 Insights):</strong> Train a local LightGBM model from your own ratings/color labels so future re-selects and shoots adapt to your personal taste.</li>
+            </ul>
+          </div>
+          <div class="help-section">
+            <h4>Safe Lightroom &amp; Photo Mechanic XMP Sync</h4>
+            <ul class="help-list">
+              <li><strong>Develop Edits Preserved:</strong> Real-time XMP sync writes atomically and only updates <code>xmp:Rating</code>, <code>xmp:Label</code>, and <code>photomechanic:ColorClass</code>. All Lightroom Develop sliders, crops, and masks stay untouched.</li>
+              <li><strong>Star Ratings Protected:</strong> Existing in-camera or Lightroom star ratings are never overwritten unless you explicitly rate a photo.</li>
+              <li><strong>Undo &amp; Restore:</strong> Press <kbd>Ctrl+Z</kbd> or open <strong>📜 Logs &amp; Restore</strong> to roll back any change (including its XMP snapshot).</li>
+            </ul>
+          </div>
         </div>
       </div>
     </div>
@@ -553,6 +769,6 @@
   <!-- TOAST -->
   <div id="toast" class="toast hidden"></div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20261124b"></script>
 </body>
 </html>

@@ -241,5 +241,5 @@ class SigLIP2Scorer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        elif hasattr(torch, "mps") and torch.backends.mps.is_available() and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()

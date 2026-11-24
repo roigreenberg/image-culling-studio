@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
+import subprocess
+import sys
+import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src.updater import check_for_updates, download_and_apply_update, get_version_info
 from webapp.db import CullDatabase, make_dir_id
 from webapp.pipeline_runner import TaskManager
 from webapp.xmp_sync import normalize_label, restore_xmp_sidecar, write_xmp_sidecar
@@ -26,30 +31,8 @@ STUDIO_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = STUDIO_DATA_DIR / "cull_studio.db"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="ImageCulling Studio", version="1.0.0")
-db = CullDatabase(DB_PATH)
-
-# WebSocket connection manager (thread-safe broadcast from background threads)
-_ws_clients: Set[WebSocket] = set()
-_main_loop: Optional[asyncio.AbstractEventLoop] = None
-
-
-def broadcast_event(payload: Dict[str, Any]) -> None:
-    """Thread-safe broadcast of JSON events to all connected WebSocket clients."""
-    if _main_loop is None or not _ws_clients:
-        return
-    for ws in list(_ws_clients):
-        try:
-            asyncio.run_coroutine_threadsafe(ws.send_json(payload), _main_loop)
-        except Exception:
-            pass
-
-
-tasks = TaskManager(db=db, broadcast=broadcast_event)
-
-
-@app.on_event("startup")
-async def _on_startup() -> None:
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _main_loop
     _main_loop = asyncio.get_running_loop()
 
@@ -70,6 +53,29 @@ async def _on_startup() -> None:
             if not facets.get("lenses") and (d.get("stats", {}).get("rated", 0) == 0):
                 logger.info("Auto-starting background EXIF/Camera/XMP scan for %s", src_path)
                 tasks.start_directory_scan(d["dir_id"])
+    yield
+
+
+app = FastAPI(title="ImageCulling Studio", version="1.0.0", lifespan=_lifespan)
+db = CullDatabase(DB_PATH)
+
+# WebSocket connection manager (thread-safe broadcast from background threads)
+_ws_clients: Set[WebSocket] = set()
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def broadcast_event(payload: Dict[str, Any]) -> None:
+    """Thread-safe broadcast of JSON events to all connected WebSocket clients."""
+    if _main_loop is None or not _ws_clients:
+        return
+    for ws in list(_ws_clients):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_json(payload), _main_loop)
+        except Exception:
+            pass
+
+
+tasks = TaskManager(db=db, broadcast=broadcast_event)
 
 
 # ------------------------------------------------------------------
@@ -112,6 +118,10 @@ class PerfEventsRequest(BaseModel):
     events: List[Dict[str, Any]]
 
 
+class BurstSplitRequest(BaseModel):
+    image_id: str
+
+
 class PreviewGenRequest(BaseModel):
     dir_id: str
     subfolder: str = ""
@@ -129,6 +139,15 @@ class SessionStateRequest(BaseModel):
     state: Dict[str, Any]
 
 
+class UpdateApplyRequest(BaseModel):
+    download_url: Optional[str] = None
+    repo: Optional[str] = None
+
+
+_update_lock = threading.Lock()
+_update_running = False
+
+
 # ------------------------------------------------------------------
 # Static & Root
 # ------------------------------------------------------------------
@@ -141,7 +160,10 @@ async def serve_index() -> HTMLResponse:
     idx = STATIC_DIR / "index.html"
     if not idx.exists():
         return HTMLResponse("<h1>ImageCulling Studio UI not found</h1>", status_code=404)
-    return HTMLResponse(idx.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        idx.read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 # ------------------------------------------------------------------
@@ -184,17 +206,24 @@ async def list_directories() -> Dict[str, Any]:
 
 @app.post("/api/directories/browse")
 async def browse_native_folder() -> Dict[str, Any]:
-    """Open native Windows folder picker dialog on the local machine."""
+    """Open native Windows folder picker dialog in a dedicated subprocess (Tk requires main thread)."""
     def _pick() -> str:
+        script = (
+            "import tkinter as tk; from tkinter import filedialog; "
+            "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True); "
+            "p = filedialog.askdirectory(title='Select Photo Directory to Cull'); "
+            "r.destroy(); print(p or '', end='')"
+        )
         try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            folder = filedialog.askdirectory(title="Select Photo Directory to Cull")
-            root.destroy()
-            return folder or ""
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+            )
+            return (proc.stdout or "").strip()
         except Exception as exc:
             logger.warning("Native folder picker failed: %s", exc)
             return ""
@@ -205,7 +234,10 @@ async def browse_native_folder() -> Dict[str, Any]:
 
 @app.post("/api/directories/open")
 async def open_directory(req: OpenDirectoryRequest) -> Dict[str, Any]:
-    p = Path(req.path.strip().strip('"'))
+    raw_path = req.path.strip().strip('"').strip("'")
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="Please enter a folder path.")
+    p = Path(raw_path).expanduser().resolve()
     if not p.exists() or not p.is_dir():
         raise HTTPException(status_code=400, detail=f"Directory does not exist or is not accessible: {p}")
 
@@ -327,6 +359,76 @@ async def get_image_detail(image_id: str) -> Dict[str, Any]:
             img["af_points"] = []
     siblings = db.get_burst_siblings(img["dir_id"], img.get("burst_id", ""))
     return {"image": img, "burst_siblings": siblings}
+
+
+@app.get("/api/bursts")
+async def query_bursts(
+    dir_id: str,
+    subfolder: str = "",
+    track: str = "",
+    species: str = "",
+    scenario_type: str = "",
+    search: str = "",
+    burst_filter: str = "",
+    use_ai_layer: bool = False,
+    sort_by: str = "timestamp",
+    offset: int = 0,
+    limit: int = Query(default=40, le=200),
+) -> Dict[str, Any]:
+    res = db.query_bursts(
+        dir_id=dir_id,
+        subfolder=subfolder,
+        track=track,
+        species=species,
+        scenario_type=scenario_type,
+        search=search,
+        burst_filter=burst_filter,
+        use_ai_layer=use_ai_layer,
+        sort_by=sort_by,
+        offset=offset,
+        limit=limit,
+    )
+    for b in res["bursts"]:
+        _warm_media_caches(b["selected_items"])
+        _warm_media_caches(b["preview_others"])
+    return res
+
+
+@app.get("/api/bursts/{dir_id}/{burst_id}")
+async def get_burst_all_frames(dir_id: str, burst_id: str, subfolder: str = "") -> Dict[str, Any]:
+    items = db.get_burst_siblings(dir_id, burst_id)
+    _warm_media_caches(items)
+    splits = {s["image_id"] for s in db.list_burst_splits(dir_id)}
+    pos_info = db.get_burst_position_info(dir_id, burst_id, subfolder=subfolder)
+    return {
+        "burst_id": burst_id,
+        "count": len(items),
+        "items": items,
+        "manual_split_ids": sorted(splits),
+        **pos_info,
+    }
+
+
+@app.get("/api/bursts/splits/{dir_id}")
+async def get_burst_splits(dir_id: str) -> Dict[str, Any]:
+    splits = db.list_burst_splits(dir_id)
+    return {"splits": splits, "image_ids": [s["image_id"] for s in splits]}
+
+
+@app.post("/api/bursts/split")
+async def split_burst(req: BurstSplitRequest) -> Dict[str, Any]:
+    try:
+        return db.split_burst_at(req.image_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/bursts/unsplit")
+async def unsplit_burst(req: BurstSplitRequest) -> Dict[str, Any]:
+    try:
+        return db.unsplit_burst(req.image_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 # ------------------------------------------------------------------
@@ -526,13 +628,81 @@ def _restore_single_change(entry: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     img = db.get_image(entry["image_id"])
     if not img:
         return False, "Image not found"
-    xmp_err = None
-    if entry.get("xmp_synced"):
-        ok, err = restore_xmp_sidecar(Path(img["source_path"]), entry.get("prev_xmp_xml"))
-        if not ok:
-            xmp_err = err
+
     db.mark_change_reverted(entry["id"], entry["field"], entry["old_value"], entry["image_id"])
+    updated_img = db.get_image(entry["image_id"]) or img
+    xmp_err = None
+
+    if entry.get("xmp_synced"):
+        src_path = Path(updated_img["source_path"])
+        siblings = [s for s in db.get_sibling_unreverted_changes(entry) if s.get("xmp_synced")]
+        prev_xml = entry.get("prev_xmp_xml")
+        if siblings:
+            # Another field from the same combined edit is still active; update only this field
+            # in the existing XMP so we never unlink or clobber the user's sidecar.
+            ok, _, _, err = write_xmp_sidecar(
+                src_path,
+                rating=updated_img["effective_rating"] if entry["field"] == "rating" else None,
+                label=updated_img["effective_label"] if entry["field"] == "label" else None,
+            )
+            if not ok:
+                xmp_err = err
+        elif prev_xml is not None:
+            ok, err = restore_xmp_sidecar(src_path, prev_xml)
+            if not ok:
+                xmp_err = err
+        else:
+            # prev_xml is None means no .xmp existed prior to this edit. Only remove the newly
+            # created sidecar if no rating/label remains; otherwise rewrite the remaining state.
+            if (updated_img.get("effective_rating") or 0) == 0 and not (updated_img.get("effective_label") or ""):
+                ok, err = restore_xmp_sidecar(src_path, None)
+                if not ok:
+                    xmp_err = err
+            else:
+                ok, _, _, err = write_xmp_sidecar(
+                    src_path,
+                    rating=updated_img.get("effective_rating"),
+                    label=updated_img.get("effective_label") or "",
+                )
+                if not ok:
+                    xmp_err = err
     return True, xmp_err
+
+
+def _restore_change_group(entries: List[Dict[str, Any]]) -> List[str]:
+    """Revert a group of change_log rows atomically, restoring each image's XMP safely once."""
+    by_image: Dict[str, List[Dict[str, Any]]] = {}
+    for e in entries:
+        by_image.setdefault(e["image_id"], []).append(e)
+
+    restored_images: List[str] = []
+    for image_id, img_entries in by_image.items():
+        img = db.get_image(image_id)
+        if not img:
+            continue
+        any_xmp = False
+        prev_xml: Optional[str] = None
+        for e in img_entries:
+            db.mark_change_reverted(e["id"], e["field"], e["old_value"], image_id)
+            if e.get("xmp_synced"):
+                any_xmp = True
+                if e.get("prev_xmp_xml") is not None:
+                    prev_xml = e["prev_xmp_xml"]
+        if any_xmp:
+            updated_img = db.get_image(image_id) or img
+            src_path = Path(updated_img["source_path"])
+            if prev_xml is not None:
+                restore_xmp_sidecar(src_path, prev_xml)
+            elif (updated_img.get("effective_rating") or 0) == 0 and not (updated_img.get("effective_label") or ""):
+                restore_xmp_sidecar(src_path, None)
+            else:
+                write_xmp_sidecar(
+                    src_path,
+                    rating=updated_img.get("effective_rating"),
+                    label=updated_img.get("effective_label") or "",
+                )
+        restored_images.append(image_id)
+    return restored_images
 
 
 @app.post("/api/changes/{change_id}/restore")
@@ -543,7 +713,6 @@ async def restore_change(change_id: int) -> Dict[str, Any]:
     if entry["reverted"]:
         return {"ok": True, "message": "Already reverted"}
 
-    # If part of a batch, restore just this one or the batch? Here restore this single entry
     ok, xmp_err = _restore_single_change(entry)
     db.add_event_log(
         "INFO",
@@ -559,17 +728,18 @@ async def undo_last_change(dir_id: str = "") -> Dict[str, Any]:
     if not entry:
         return {"ok": False, "message": "Nothing to undo"}
 
-    restored_images = []
     if entry.get("batch_id"):
         batch_entries = db.get_batch_changes(entry["batch_id"])
-        for be in batch_entries:
-            _restore_single_change(be)
-            restored_images.append(be["image_id"])
+        restored_images = _restore_change_group(batch_entries)
         msg = f"Undid batch of {len(batch_entries)} changes ({entry['batch_id']})"
     else:
-        _restore_single_change(entry)
-        restored_images.append(entry["image_id"])
-        msg = f"Undid {entry['filename']} ({entry['field']}: {entry['new_value']} -> {entry['old_value']})"
+        group = [entry] + db.get_sibling_unreverted_changes(entry)
+        restored_images = _restore_change_group(group)
+        if len(group) > 1:
+            fields = ", ".join(e["field"] for e in group)
+            msg = f"Undid {entry['filename']} ({fields})"
+        else:
+            msg = f"Undid {entry['filename']} ({entry['field']}: {entry['new_value']} -> {entry['old_value']})"
 
     db.add_event_log("INFO", "system", msg)
     return {"ok": True, "message": msg, "image_ids": restored_images}
@@ -595,6 +765,8 @@ async def apply_ai_xmp(req: ApplyAiXmpRequest) -> Dict[str, Any]:
 # ------------------------------------------------------------------
 @app.post("/api/pipeline/start")
 async def start_pipeline(req: PipelineStartRequest) -> Dict[str, Any]:
+    if _update_running:
+        raise HTTPException(status_code=409, detail="Cannot start culling while an application update is in progress.")
     ok, msg = tasks.start_culling(
         dir_id=req.dir_id,
         mode=req.mode,
@@ -608,6 +780,8 @@ async def start_pipeline(req: PipelineStartRequest) -> Dict[str, Any]:
 
 @app.post("/api/pipeline/reselect")
 async def reselect_pipeline(req: ReselectRequest) -> Dict[str, Any]:
+    if _update_running:
+        raise HTTPException(status_code=409, detail="Cannot run reselect while an application update is in progress.")
     ok, msg = tasks.start_reselect(dir_id=req.dir_id)
     if not ok:
         raise HTTPException(status_code=409, detail=msg)
@@ -732,3 +906,72 @@ async def get_session() -> Dict[str, Any]:
 async def put_session(req: SessionStateRequest) -> Dict[str, Any]:
     db.save_session_state(req.state)
     return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# System Version & GitHub Releases Auto-Updater
+# ------------------------------------------------------------------
+@app.get("/api/system/version")
+async def system_version() -> Dict[str, Any]:
+    return get_version_info()
+
+
+@app.get("/api/system/update-check")
+async def system_update_check(repo: Optional[str] = None) -> Dict[str, Any]:
+    return await asyncio.to_thread(check_for_updates, 6.0, repo)
+
+
+@app.post("/api/system/update-apply")
+async def system_update_apply(req: Optional[UpdateApplyRequest] = None) -> Dict[str, Any]:
+    global _update_running
+    if tasks.get_status().get("active"):
+        raise HTTPException(
+            status_code=409,
+            detail="A culling or scan task is currently running. Please wait or cancel it before updating.",
+        )
+    with _update_lock:
+        if _update_running:
+            raise HTTPException(status_code=409, detail="An update is already in progress.")
+        _update_running = True
+
+    def _progress(msg: str, pct: float, *, stage: Optional[str] = None) -> None:
+        is_active = pct < 100.0 and stage != "error"
+        eff_stage = stage or ("updating" if is_active else "done")
+        broadcast_event(
+            {
+                "type": "task_progress",
+                "data": {
+                    "active": is_active,
+                    "task_type": "update",
+                    "stage": eff_stage,
+                    "message": msg,
+                    "percent": round(pct, 1),
+                    "current": int(round(pct)),
+                    "total": 100,
+                },
+            }
+        )
+
+    try:
+        db.add_event_log("INFO", "system", "Starting application update from GitHub Releases...")
+        result = await asyncio.to_thread(
+            download_and_apply_update,
+            req.download_url if req else None,
+            req.repo if req else None,
+            _progress,
+        )
+        if result.get("ok") and result.get("updated"):
+            db.add_event_log(
+                "INFO",
+                "system",
+                result.get("message") or "Application update applied. Restart required.",
+                details={"previous_version": result.get("previous_version"), "new_version": result.get("new_version")},
+            )
+        elif not result.get("ok"):
+            err_msg = result.get("error", "unknown error")
+            db.add_event_log("ERROR", "system", f"Update failed: {err_msg}")
+            _progress(f"Update failed: {err_msg}", 100.0, stage="error")
+        return result
+    finally:
+        with _update_lock:
+            _update_running = False

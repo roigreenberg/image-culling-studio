@@ -300,13 +300,15 @@ class TaskManager:
             import os
             import rawpy
             from PIL import Image
-            from src.io_utils import apply_orientation_bgr, parse_cr3_exif_from_stream
+            from src.config import RAW_EXTENSIONS
+            from src.io_utils import apply_orientation_bgr, parse_cr3_exif_from_stream, parse_raw_exif_from_stream
 
             full_dir.mkdir(parents=True, exist_ok=True)
             orient = 1
-            if src.suffix.lower() == ".cr3":
+            suffix = src.suffix.lower()
+            if suffix in RAW_EXTENSIONS:
                 with open(src, "rb") as fh:
-                    meta = parse_cr3_exif_from_stream(fh)
+                    meta = parse_cr3_exif_from_stream(fh) if suffix == ".cr3" else parse_raw_exif_from_stream(fh)
                     orient = int(meta.get("orientation", 1) or 1)
                     fh.seek(0)
                     with rawpy.imread(fh) as raw:
@@ -602,8 +604,28 @@ class TaskManager:
             )
             from src.siglip2_scorer import SigLIP2Scorer
 
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA GPU is not available for AI culling.")
+            has_cuda = torch.cuda.is_available()
+            has_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            if has_cuda:
+                device_label = "CUDA GPU"
+                props = torch.cuda.get_device_properties(0)
+                self._log(
+                    "INFO",
+                    "pipeline",
+                    f"AI culling device: {props.name} ({props.total_memory / (1024**3):.1f} GB VRAM)",
+                    run_id=run_id,
+                )
+            elif has_mps:
+                device_label = "Apple Silicon MPS"
+                self._log("INFO", "pipeline", "AI culling device: Apple Silicon MPS", run_id=run_id)
+            else:
+                device_label = "CPU"
+                self._log(
+                    "WARNING",
+                    "pipeline",
+                    "No CUDA/MPS GPU detected — running AI culling on CPU (slower).",
+                    run_id=run_id,
+                )
 
             # Determine target images
             target_items: List[Tuple[Path, str, str]] = []
@@ -667,7 +689,7 @@ class TaskManager:
             hq_q = int(settings.get("hq_preview_quality", 86))
 
             # Step 2A: Project Kestrel (MegaDetector + SAM-HQ + BioCLIP 2 + AnimalGate + QualityClassifier)
-            self._emit_status(stage="step2a_kestrel", total=total, message="Loading Project Kestrel (MegaDetector + SAM-HQ + BioCLIP 2) on GPU...")
+            self._emit_status(stage="step2a_kestrel", total=total, message=f"Loading Project Kestrel (MegaDetector + SAM-HQ + BioCLIP 2) on {device_label}...")
             kestrel = KestrelCoreRunner(cfg)
             skipped_errors = 0
             records: List[Dict[str, Any]] = []
@@ -828,8 +850,8 @@ class TaskManager:
 
             bio_embs = np.stack(bio_emb_list).astype(np.float16)
 
-            # Step 2B: SigLIP 2 (GPU fp16)
-            self._emit_status(stage="step2b_siglip2", percent=72.0, message="Running SigLIP 2 scoring on GPU...")
+            # Step 2B: SigLIP 2 (CUDA FP16 / Apple Silicon MPS / CPU fallback)
+            self._emit_status(stage="step2b_siglip2", percent=72.0, message=f"Running SigLIP 2 scoring on {device_label}...")
             siglip2 = SigLIP2Scorer(cfg)
             siglip_embs = siglip2.score_all_images(records, output_dir)
             siglip2.close()
@@ -840,10 +862,60 @@ class TaskManager:
             records = route_and_score_all(records, cfg, bioclip_embs=bio_embs, siglip_embs=siglip_embs)
             records = select_layers_final(records, cfg, siglip_embs=siglip_embs)
 
-            # Save embeddings.npz & results.json when running full directory
-            if mode == "full" and (not subfolder or subfolder == "__all__"):
-                self._emit_status(stage="saving", percent=93.0, message="Saving results.json & embeddings.npz...")
+            # Save/merge embeddings.npz & results.json on every culling run so
+            # Fast Reselect & Personal Ranker work right after "Run Unculled Only" too!
+            self._emit_status(stage="saving", percent=93.0, message="Saving results.json & embeddings.npz...")
+            is_full_dir = mode == "full" and (not subfolder or subfolder == "__all__")
+            res_path = output_dir / "results.json"
+            npz_path = output_dir / "embeddings.npz"
+            if is_full_dir or not (res_path.is_file() and npz_path.is_file()):
                 write_structured_data_and_embeddings(records, bio_embs, siglip_embs, cfg)
+            else:
+                try:
+                    prev_records = json.loads(res_path.read_text(encoding="utf-8"))
+                    prev_npz = np.load(npz_path)
+                    prev_ids = [str(x) for x in prev_npz["image_ids"]]
+                    prev_bio = prev_npz["bioclip_embs"].astype(np.float16)
+                    prev_sig = prev_npz["siglip_embs"].astype(np.float16)
+                    prev_idx_by_id = {iid: idx for idx, iid in enumerate(prev_ids)}
+
+                    new_by_id = {r["image_id"]: r for r in records}
+                    merged_records: List[Dict[str, Any]] = []
+                    merged_bio_list: List[np.ndarray] = []
+                    merged_sig_list: List[np.ndarray] = []
+
+                    # Keep previously cached records not replaced in this run
+                    for pr in prev_records:
+                        pid = pr.get("image_id")
+                        if not pid or pid in new_by_id:
+                            continue
+                        pidx = prev_idx_by_id.get(pid)
+                        if pidx is None:
+                            continue
+                        pr_copy = dict(pr)
+                        pr_copy["_emb_idx"] = len(merged_records)
+                        merged_records.append(pr_copy)
+                        merged_bio_list.append(prev_bio[pidx])
+                        merged_sig_list.append(prev_sig[pidx])
+
+                    # Append newly processed records
+                    for nr in records:
+                        nidx = int(nr["_emb_idx"])
+                        nr_copy = dict(nr)
+                        nr_copy["_emb_idx"] = len(merged_records)
+                        merged_records.append(nr_copy)
+                        merged_bio_list.append(bio_embs[nidx])
+                        merged_sig_list.append(siglip_embs[nidx])
+
+                    if merged_records:
+                        merged_bio = np.stack(merged_bio_list).astype(np.float16)
+                        merged_sig = np.stack(merged_sig_list).astype(np.float16)
+                        write_structured_data_and_embeddings(merged_records, merged_bio, merged_sig, cfg)
+                    else:
+                        write_structured_data_and_embeddings(records, bio_embs, siglip_embs, cfg)
+                except Exception as merge_exc:
+                    logger.warning("Failed to merge cached embeddings; writing current run only: %s", merge_exc)
+                    write_structured_data_and_embeddings(records, bio_embs, siglip_embs, cfg)
 
             # Save to SQLite (preserving user ratings & XMPs strictly separately!)
             self._emit_status(stage="saving", percent=96.0, message="Saving Project Kestrel results to database...")
@@ -1010,10 +1082,14 @@ class TaskManager:
         workspace_root = Path(__file__).resolve().parent.parent
         picks_path = workspace_root / "studio_data" / "my_picks.json"
         picks_path.parent.mkdir(parents=True, exist_ok=True)
-        picks_path.write_text(json.dumps({"picks": picks}, indent=2), encoding="utf-8")
+        manual_splits = self.db.list_burst_splits(dir_id)
+        picks_path.write_text(
+            json.dumps({"picks": picks, "manual_burst_splits": manual_splits}, indent=2),
+            encoding="utf-8",
+        )
 
         model_out = workspace_root / "models" / "personal_ranker.pkl"
-        history_jsonl = workspace_root / "models" / "training_history.jsonl"
+        history_jsonl = workspace_root / "models" / "feedback_history.jsonl"
 
         from train_ranker import train_from_picks
 

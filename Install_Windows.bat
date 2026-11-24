@@ -59,6 +59,11 @@ if %ERRORLEVEL%==0 set "HAS_NVIDIA=1"
 if "%HAS_NVIDIA%"=="1" (
     echo [3/5] NVIDIA GPU detected! Installing CUDA PyTorch + onnxruntime-gpu...
     "%UV_EXE%" pip install --python .venv\Scripts\python.exe torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    if errorlevel 1 (
+        echo ERROR: Failed to install CUDA PyTorch.
+        pause
+        exit /b 1
+    )
     "%UV_EXE%" pip install --python .venv\Scripts\python.exe onnxruntime-gpu
 ) else (
     echo [3/5] No NVIDIA GPU detected. Installing CPU PyTorch + onnxruntime...

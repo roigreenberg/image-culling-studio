@@ -87,3 +87,11 @@ vendor/ProjectKestrel/analyzer/models/siglip/
 vendor/ProjectKestrel/analyzer/models/labels.txt
 vendor/ProjectKestrel/analyzer/models/labels_scispecies.csv
 vendor/ProjectKestrel/analyzer/models/scispecies_dispname.csv
+
+# Playwright / Node E2E
+node_modules/
+test-results/
+playwright-report/
+
+# Local Remotion Promo Video Production Workspace (contains private UI screenshots & large renders)
+promo_video/

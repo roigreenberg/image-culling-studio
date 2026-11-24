@@ -1,13 +1,10 @@
-ultralytics
 transformers
-accelerate
 sentencepiece
 protobuf
 rawpy
 pillow
 opencv-python-headless
 numpy
-scipy
 pandas
 tqdm
 exifread
@@ -16,5 +13,4 @@ lightgbm
 scikit-learn
 joblib
 fastapi
-uvicorn
-python-multipart
+uvicorn[standard]

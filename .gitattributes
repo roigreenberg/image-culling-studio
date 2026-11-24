@@ -1,0 +1,13 @@
+# Normalize text line endings to LF across Windows, macOS, and Linux
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.onnx binary
+*.data binary
+*.npy binary
+*.npz binary
+*.pkl binary
+*.db binary

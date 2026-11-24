@@ -21,7 +21,7 @@ BLOCKED_NAME_FRAGMENTS = ("secret", "token", "credential")
 
 BLOCKED_EXACT_NAMES = {".env", "my_picks.json", "embeddings.npz", "feedback_history.jsonl", "training_history.jsonl"}
 
-BLOCKED_DIR_PREFIXES = ("cull_output/", "studio_data/", "models/", ".venv/")
+BLOCKED_DIR_PREFIXES = ("cull_output/", "studio_data/", "models/", ".venv/", "node_modules/", "test-results/", "playwright-report/", "promo_video/")
 
 SECRET_PATTERNS = [
     ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),

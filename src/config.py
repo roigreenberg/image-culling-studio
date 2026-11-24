@@ -4,7 +4,19 @@ from pathlib import Path
 from typing import Optional, Set
 
 
-IMAGE_EXTENSIONS: Set[str] = {".cr3", ".jpg", ".jpeg"}
+RAW_EXTENSIONS: Set[str] = {
+    ".cr3", ".cr2",         # Canon
+    ".nef", ".nrw",         # Nikon
+    ".arw", ".sr2", ".srf", # Sony
+    ".dng",                 # Adobe / generic DNG
+    ".raf",                 # Fujifilm
+    ".orf",                 # Olympus / OM System
+    ".rw2",                 # Panasonic
+    ".pef",                 # Pentax
+    ".srw",                 # Samsung
+    ".3fr",                 # Hasselblad
+}
+IMAGE_EXTENSIONS: Set[str] = RAW_EXTENSIONS | {".jpg", ".jpeg"}
 
 
 def load_local_env(env_path: Path = Path(".env")) -> None:

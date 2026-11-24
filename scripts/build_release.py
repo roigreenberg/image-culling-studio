@@ -30,6 +30,8 @@ SECRET_PATTERNS = [
 USER_PATH_PATTERN = re.compile(r"(C:\\Users\\|/Users/|/home/)", re.IGNORECASE)
 PATH_DOC_ALLOWLIST = {"SECURITY.md", "scripts/pre-commit", "scripts/build_release.py"}
 EXEC_FILES = {"Install_MacOS.command", "Start_MacOS.command", "scripts/pre-commit"}
+EXCLUDED_RELEASE_FILES = {"package.json", "package-lock.json", "playwright.config.js"}
+EXCLUDED_RELEASE_PREFIXES = ("tests/", "docs/")
 
 
 def _tracked_files() -> list[str]:
@@ -52,6 +54,8 @@ def build_release_zip(out_dir: Path) -> Path:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for rel in files:
             norm = rel.replace("\\", "/")
+            if norm in EXCLUDED_RELEASE_FILES or any(norm.startswith(p) for p in EXCLUDED_RELEASE_PREFIXES):
+                continue
             full = WORKSPACE_ROOT / norm
             if not full.is_file():
                 continue

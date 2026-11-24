@@ -73,7 +73,40 @@
     dragStartFocusY: 0.5,
     compareShowCrop: false,
     compareItems: [],
+    // #1 Burst-by-Burst Gallery state
+    bursts: [],
+    burstsTotal: 0,
+    burstsOffset: 0,
+    burstsLoading: false,
+    burstFilter: "",
+    burstSort: "timestamp",
+    activeBurstIdx: 0,
+    expandedBursts: new Map(), // burst_id -> full items array
+    manualSplits: new Set(),   // image_ids where user manually split a burst
+    // #2 Winner vs Challenger Split-Screen state
+    wvcBurstId: "",
+    wvcFrames: [],
+    wvcWinnerIdx: 0,
+    wvcChalIdx: 0,
+    wvcBurstPos: 0,
+    wvcTotalBursts: 0,
+    wvcFirstImgPos: 0,
+    wvcTotalImgs: 0,
+    wvcZoomed: false,
+    wvcScale: 3.2,
+    wvcPanX: 0,
+    wvcPanY: 0,
+    wvcDragging: false,
+    wvcDragMoved: false,
+    wvcDragStartX: 0,
+    wvcDragStartY: 0,
+    wvcDragStartPanX: 0,
+    wvcDragStartPanY: 0,
+    wvcReturnView: "grid",
     ws: null,
+    versionInfo: null,
+    updateInfo: null,
+    updatingApp: false,
     preloadCache: new Map(),
     fullPreloadCache: new Map(),
     loupeLoadedFullId: "",
@@ -82,6 +115,7 @@
     perfQueue: [],
     perfFlushTimer: null,
     saveSessionTimer: null,
+    isRestoring: true,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -206,6 +240,7 @@
   }
 
   function saveLocalScrollState() {
+    if (state.isRestoring) return;
     try {
       const gridEl = $("gridView");
       if (!state.currentDirId) return;
@@ -215,15 +250,20 @@
       const scrollTop = (state.view === "grid" && gridEl && gridEl.scrollHeight > 0)
         ? Math.round(gridEl.scrollTop || 0)
         : (prev.dir_id === state.currentDirId && prev.subfolder === state.filters.subfolder ? (prev.scrollTop || 0) : 0);
+      const wvcWin = state.wvcFrames[state.wvcWinnerIdx];
+      const wvcChal = state.wvcFrames[state.wvcChalIdx];
       sessionStorage.setItem("cull_grid_pos", JSON.stringify({
         dir_id: state.currentDirId,
         subfolder: state.filters.subfolder,
         filters: state.filters,
-        view: state.view === "compare" ? "grid" : state.view,
+        view: state.view,
         active_image_id: activeImg ? activeImg.image_id : (prev.active_image_id || ""),
         active_index: state.activeIndex || 0,
         scrollTop,
         loadedCount: Math.max(state.items.length, prev.loadedCount || 0),
+        wvc_burst_id: state.wvcBurstId || prev.wvc_burst_id || "",
+        wvc_winner_id: wvcWin ? wvcWin.image_id : (prev.wvc_winner_id || ""),
+        wvc_chal_id: wvcChal ? wvcChal.image_id : (prev.wvc_chal_id || ""),
       }));
     } catch (_) {}
   }
@@ -238,6 +278,7 @@
   }
 
   function scheduleSessionSave() {
+    if (state.isRestoring) return;
     saveLocalScrollState();
     clearTimeout(state.saveSessionTimer);
     state.saveSessionTimer = setTimeout(() => {
@@ -249,11 +290,14 @@
           state: {
             dir_id: state.currentDirId,
             filters: state.filters,
-            view: state.view === "compare" ? "grid" : state.view,
+            view: state.view,
             active_image_id: activeImg ? activeImg.image_id : "",
             active_index: state.activeIndex || 0,
             grid_scroll_top: local.scrollTop || 0,
             loaded_count: state.items.length,
+            wvc_burst_id: local.wvc_burst_id || "",
+            wvc_winner_id: local.wvc_winner_id || "",
+            wvc_chal_id: local.wvc_chal_id || "",
           },
         }),
       }).catch(() => {});
@@ -358,13 +402,22 @@
         const resumeLoaded = (merged.dir_id === initialDir.dir_id) ? Math.max(merged.loadedCount || 0, merged.loaded_count || 0, (merged.active_index || 0) + 60) : 0;
         const resumeImgId = (merged.dir_id === initialDir.dir_id) ? (merged.active_image_id || "") : "";
         const resumeView = (merged.dir_id === initialDir.dir_id) ? (merged.view || "grid") : "grid";
-        await selectDirectory(initialDir.dir_id, resumeImgId, resumeView, resumeScroll, resumeLoaded);
+        const resumeWvc = (merged.dir_id === initialDir.dir_id && merged.wvc_burst_id)
+          ? { burst_id: merged.wvc_burst_id, winner_id: merged.wvc_winner_id || "", chal_id: merged.wvc_chal_id || "" }
+          : null;
+        await selectDirectory(initialDir.dir_id, resumeImgId, resumeView, resumeScroll, resumeLoaded, resumeWvc);
       } else {
-        toast("Click 'Open Folder' to add your first photo directory.");
+        if ($("welcomeCard")) $("welcomeCard").classList.remove("hidden");
       }
     } catch (err) {
       toast("Startup error: " + err.message, 5000);
+    } finally {
+      state.isRestoring = false;
+      saveLocalScrollState();
     }
+    // Non-blocking background version & GitHub Releases update check (fails silently if offline)
+    loadVersionInfo().catch(() => {});
+    checkAppUpdates(false).catch(() => {});
   }
 
   function renderDirectorySelector() {
@@ -379,7 +432,8 @@
     if (state.currentDirId) sel.value = state.currentDirId;
   }
 
-  async function selectDirectory(dirId, resumeImageId = "", resumeView = "grid", resumeScrollTop = 0, resumeLoadedCount = 0) {
+  async function selectDirectory(dirId, resumeImageId = "", resumeView = "grid", resumeScrollTop = 0, resumeLoadedCount = 0, resumeWvc = null) {
+    if ($("welcomeCard")) $("welcomeCard").classList.add("hidden");
     state.currentDirId = dirId;
     $("dirSelect").value = dirId;
     state.selectedIds.clear();
@@ -391,6 +445,7 @@
     renderFolders(dir);
     updateLayerBadges(dir);
     await loadFacets();
+    loadManualSplits(dirId);
     syncFilterControlsFromState();
 
     // Load enough images to restore exact previous scroll position or active picture cleanly
@@ -405,7 +460,11 @@
       const idx = state.items.findIndex((x) => x.image_id === resumeImageId);
       if (idx >= 0) state.activeIndex = idx;
     }
-    if (resumeView === "loupe" && state.items.length > 0) {
+    if (resumeView === "compare" && resumeWvc && resumeWvc.burst_id) {
+      await openWinnerVsChallengerForBurst(resumeWvc.burst_id, resumeWvc.chal_id, resumeWvc.winner_id);
+    } else if (resumeView === "bursts") {
+      setView("bursts");
+    } else if (resumeView === "loupe" && state.items.length > 0) {
       setView("loupe");
     } else {
       setView("grid");
@@ -697,14 +756,20 @@
 
     const spd = getSpeedInfo(img.exposure_seconds, img.exposure_time);
     const scoreTxt = img.is_culled ? Math.round(img.overall_score || img.sharpness_score || 0) : "—";
-    const layerLbl = LAYER_LABELS[img.ai_layer] || img.ai_layer;
+    const dispLayer = getDisplayLayerForImage(img);
+    const layerLbl = LAYER_LABELS[dispLayer] || dispLayer;
+
+    const canSplit = img.burst_size > 1 && img.burst_index > 1;
+    const canUnsplit = state.manualSplits.has(img.image_id);
 
     card.innerHTML = `
       <div class="card-thumb-wrap">
         <input type="checkbox" class="card-chk" ${state.selectedIds.has(img.image_id) ? "checked" : ""} />
         <img class="card-thumb" loading="lazy" decoding="async" src="/api/media/thumb/${encodeURIComponent(img.image_id)}" alt="${escapeHtml(img.filename)}" />
-        <span class="card-layer-pill pill-${escapeHtml(img.ai_layer)}">${escapeHtml(layerLbl)}</span>
-        ${img.burst_size > 1 ? `<span class="card-burst-badge">${escapeHtml(img.burst_id)} #${img.burst_rank}/${img.burst_size}</span>` : ""}
+        <span class="card-layer-pill pill-${escapeHtml(dispLayer)}">${escapeHtml(layerLbl)}</span>
+        ${canSplit ? `<button class="card-split-btn" style="top:28px" data-split-id="${escapeHtml(img.image_id)}" title="Split burst at #${img.burst_index}/${img.burst_size}">✂ Split</button>` : ""}
+        ${canUnsplit ? `<button class="card-split-btn merge-btn" style="top:28px" data-unsplit-id="${escapeHtml(img.image_id)}" title="Merge split burst back">🔗 Merge</button>` : ""}
+        ${img.burst_size > 1 ? `<span class="card-burst-badge">${escapeHtml(img.burst_id)} #${img.burst_index}/${img.burst_size}</span>` : ""}
         <span class="card-score-badge" title="AI Score (Sharpness: ${Math.round(img.sharpness_score || 0)})">${scoreTxt}</span>
       </div>
       <div class="card-meta">
@@ -725,6 +790,10 @@
       toggleSelect(img.image_id, chk.checked);
       card.classList.toggle("selected", chk.checked);
     });
+    const spBtn = card.querySelector("[data-split-id]");
+    if (spBtn) spBtn.onclick = (e) => { e.stopPropagation(); splitBurstAt(img.image_id); };
+    const unspBtn = card.querySelector("[data-unsplit-id]");
+    if (unspBtn) unspBtn.onclick = (e) => { e.stopPropagation(); unsplitBurstAt(img.image_id); };
 
     card.addEventListener("click", (e) => {
       if (e.ctrlKey || e.metaKey) {
@@ -746,14 +815,74 @@
     return card;
   }
 
+  function getDisplayLayerForImage(img) {
+    if (state.filters.use_ai_layer) return img.ai_layer || "rejected";
+    const lbl = img.effective_label || "";
+    if (lbl === "Green") return "layer2_to_edit";
+    if (lbl === "Yellow") return "layer1_keep";
+    if (lbl === "Red") return "to_delete";
+    return img.is_culled ? "rejected" : "unculled";
+  }
+
+  function applyImageColorFrame(imgEl, label) {
+    if (!imgEl) return;
+    imgEl.classList.remove("img-label-Green", "img-label-Yellow", "img-label-Red", "img-label-Blue", "img-label-Purple");
+    if (label) imgEl.classList.add(`img-label-${label}`);
+    if (imgEl.id === "loupeImg") {
+      const ca = $("loupeCanvasArea");
+      if (ca) {
+        ca.classList.remove("canvas-label-Green", "canvas-label-Yellow", "canvas-label-Red", "canvas-label-Blue", "canvas-label-Purple");
+        if (label) ca.classList.add(`canvas-label-${label}`);
+      }
+    }
+  }
+
   function refreshCardInDom(img) {
+    const dispLayer = getDisplayLayerForImage(img);
+    const layerLbl = LAYER_LABELS[dispLayer] || dispLayer;
+
+    // 1. Update Grid card (border, pill, stars)
     const card = document.querySelector(`.photo-card[data-id="${CSS.escape(img.image_id)}"]`);
-    if (!card) return;
-    card.className = "photo-card" +
-      (state.selectedIds.has(img.image_id) ? " selected" : "") +
-      (img.effective_label ? ` label-${img.effective_label}` : "");
-    const stars = card.querySelector(".card-stars");
-    if (stars) stars.innerHTML = renderStarsText(img.effective_rating);
+    if (card) {
+      card.className = "photo-card" +
+        (state.selectedIds.has(img.image_id) ? " selected" : "") +
+        (img.effective_label ? ` label-${img.effective_label}` : "");
+      const stars = card.querySelector(".card-stars");
+      if (stars) stars.innerHTML = renderStarsText(img.effective_rating);
+      const pill = card.querySelector(".card-layer-pill");
+      if (pill) {
+        pill.className = `card-layer-pill pill-${dispLayer}`;
+        pill.textContent = layerLbl;
+      }
+    }
+
+    // 2. Update Filmstrip thumbnail (in Loupe & Winner vs Challenger)
+    document.querySelectorAll(`.fs-item[data-id="${CSS.escape(img.image_id)}"]`).forEach((fs) => {
+      fs.classList.remove("fs-label-Green", "fs-label-Yellow", "fs-label-Red", "fs-label-Blue", "fs-label-Purple");
+      if (img.effective_label) fs.classList.add(`fs-label-${img.effective_label}`);
+      let st = fs.querySelector(".fs-star-mini");
+      if (img.effective_rating) {
+        if (!st) { st = document.createElement("span"); st.className = "fs-star-mini"; fs.appendChild(st); }
+        st.textContent = "★".repeat(img.effective_rating);
+      } else if (st) {
+        st.remove();
+      }
+    });
+
+    // 3. Update Burst-by-Burst card if visible
+    document.querySelectorAll(`.burst-card[data-id="${CSS.escape(img.image_id)}"]`).forEach((bc) => {
+      const lbl = img.effective_label || "";
+      bc.className = "burst-card" + (lbl ? ` b-label-${lbl}` : " is-unselected");
+      let tag = bc.querySelector(".burst-pick-tag");
+      const tagTxt = lbl === "Green" ? "✓ EDIT" : (lbl === "Yellow" ? "✓ KEEP" : (lbl === "Red" ? "✕ DEL" : ""));
+      if (tagTxt) {
+        if (!tag) { tag = document.createElement("span"); bc.appendChild(tag); }
+        tag.className = `burst-pick-tag bpt-${lbl}`;
+        tag.textContent = tagTxt;
+      } else if (tag) {
+        tag.remove();
+      }
+    });
   }
 
   function toggleSelect(imageId, selected) {
@@ -786,10 +915,13 @@
       b.classList.toggle("active", b.dataset.view === viewName);
     });
     $("gridView").classList.toggle("hidden", viewName !== "grid");
+    if ($("burstsView")) $("burstsView").classList.toggle("hidden", viewName !== "bursts");
     $("loupeView").classList.toggle("hidden", viewName !== "loupe");
     $("compareView").classList.toggle("hidden", viewName !== "compare");
 
-    if (viewName === "loupe") {
+    if (viewName === "bursts") {
+      loadBursts(true);
+    } else if (viewName === "loupe") {
       if (state.items.length === 0) {
         toast("No images match current filters.");
         setView("grid");
@@ -798,6 +930,7 @@
       if (state.activeIndex >= state.items.length) state.activeIndex = 0;
       renderLoupe();
     } else if (viewName === "compare") {
+      state.wvcReturnView = (prevView === "bursts" || prevView === "loupe") ? prevView : "grid";
       openCompareView();
     } else if (viewName === "grid" && prevView === "loupe") {
       // Returning from Loupe (Esc / G) -> scroll straight to the exact image you just left!
@@ -885,7 +1018,12 @@
     // Aggressive preload next 4 & prev 2 HQ JPGs in browser cache for 0ms flipping!
     preloadNeighbors(state.activeIndex);
 
-    // Top HUD — clickable folder (copies full folder path) & filename (copies filename)
+    // Top HUD — image counter + clickable folder (copies full folder path) & filename (copies filename)
+    const loupeCtr = $("loupeCounter");
+    if (loupeCtr) {
+      const tot = state.total || state.items.length || 0;
+      loupeCtr.textContent = `Image ${(state.activeIndex + 1).toLocaleString()} / ${tot.toLocaleString()}`;
+    }
     const folderFullPath = getParentDirPath(img.source_path);
     const fnEl = $("loupeFilename");
     fnEl.innerHTML =
@@ -901,8 +1039,10 @@
       copyToClipboard(img.filename, "filename");
     };
     const lp = $("loupeLayerPill");
-    lp.textContent = LAYER_LABELS[img.ai_layer] || img.ai_layer;
-    lp.className = `hud-chip pill-${img.ai_layer}`;
+    const dispLayer = getDisplayLayerForImage(img);
+    lp.textContent = LAYER_LABELS[dispLayer] || dispLayer;
+    lp.className = `hud-chip pill-${dispLayer}`;
+    applyImageColorFrame($("loupeImg"), img.effective_label);
 
     const spd = getSpeedInfo(img.exposure_seconds, img.exposure_time);
     const sp = $("loupeSpeedPill");
@@ -913,6 +1053,12 @@
     $("btnToggleAf").classList.toggle("active", state.showAfPoints);
     $("btnToggleHighlights").classList.toggle("active", state.showHighlights);
     $("btnToggleBbox").classList.toggle("active", state.showBbox);
+    if ($("btnLoupeSplitBurst")) {
+      $("btnLoupeSplitBurst").classList.toggle("hidden", !(img.burst_size > 1 && img.burst_index > 1));
+    }
+    if ($("btnLoupeUnsplitBurst")) {
+      $("btnLoupeUnsplitBurst").classList.toggle("hidden", !state.manualSplits.has(img.image_id));
+    }
     updateZoomPresetUI();
 
     // Bottom rating & color picker
@@ -1415,6 +1561,15 @@
     $("btnFlagPick").classList.toggle("active", img.user_flag === 1);
     $("btnFlagReject").classList.toggle("active", img.user_flag === -1);
 
+    // Immediately reflect current color directly on the Loupe image border & top HUD pill
+    applyImageColorFrame($("loupeImg"), img.effective_label);
+    const lp = $("loupeLayerPill");
+    if (lp) {
+      const dispLayer = getDisplayLayerForImage(img);
+      lp.textContent = LAYER_LABELS[dispLayer] || dispLayer;
+      lp.className = `hud-chip pill-${dispLayer}`;
+    }
+
     const xmpEl = $("loupeXmpStatus");
     if (img.xmp_exists) {
       xmpEl.textContent = `XMP ✓ (${img.rating_source})`;
@@ -1502,9 +1657,10 @@
 
   function createFilmstripItemEl(item, currentId) {
     const div = document.createElement("div");
-    div.className = "fs-item" + (item.image_id === currentId ? " active" : "");
+    const lblCls = item.effective_label ? ` fs-label-${item.effective_label}` : "";
+    div.className = "fs-item" + lblCls + (item.image_id === currentId ? " active" : "");
     div.dataset.id = item.image_id;
-    div.title = `${item.filename} · Sharp: ${Math.round(item.sharpness_score || 0)}`;
+    div.title = `${item.filename} · ${item.effective_label || "Unselected"} · Sharp: ${Math.round(item.sharpness_score || 0)}`;
     div.innerHTML = `
       <img loading="lazy" decoding="async" src="/api/media/thumb/${encodeURIComponent(item.image_id)}" alt="" />
       <div class="fs-sharp-bar" style="width:${Math.min(100, item.sharpness_score || 0)}%"></div>
@@ -1576,74 +1732,568 @@
   }
 
   // ------------------------------------------------------------------
-  // Compare View (Selected images OR Top 4 of current burst)
+  // #1 BURST-BY-BURST GALLERY MODE
   // ------------------------------------------------------------------
-  async function openCompareView() {
-    let items = [];
-    if (state.selectedIds.size >= 2) {
-      items = state.items.filter((x) => state.selectedIds.has(x.image_id)).slice(0, 6);
-      $("compareTitle").textContent = `Comparing ${items.length} Selected Images`;
-    } else if (state.items[state.activeIndex]) {
-      const cur = state.items[state.activeIndex];
-      if (cur.burst_id) {
-        const res = await api(`/api/images/${encodeURIComponent(cur.image_id)}`);
-        items = (res.burst_siblings || [cur])
-          .sort((a, b) => (b.sharpness_score || 0) - (a.sharpness_score || 0))
-          .slice(0, 4);
-        $("compareTitle").textContent = `Burst ${cur.burst_id} — Top ${items.length} Sharpest Frames`;
-      } else {
-        items = state.items.slice(state.activeIndex, state.activeIndex + 2);
-        $("compareTitle").textContent = `Comparing ${items.length} Adjacent Images`;
-      }
+  async function loadBursts(reset = false) {
+    if (!state.currentDirId || state.burstsLoading) return;
+    state.burstsLoading = true;
+    if (reset) {
+      state.burstsOffset = 0;
+      state.bursts = [];
+      state.activeBurstIdx = 0;
+      if ($("burstsList")) $("burstsList").innerHTML = "";
     }
-    state.compareItems = items;
-    renderCompareGrid();
+    const f = state.filters;
+    const params = new URLSearchParams({
+      dir_id: state.currentDirId,
+      subfolder: f.subfolder === "__all__" ? "" : f.subfolder,
+      track: f.track || "",
+      species: f.species || "",
+      scenario_type: f.scenario_type || "",
+      search: f.search || "",
+      burst_filter: state.burstFilter || "",
+      use_ai_layer: String(!!f.use_ai_layer),
+      sort_by: state.burstSort || "timestamp",
+      offset: String(state.burstsOffset),
+      limit: "40",
+    });
+    try {
+      const res = await api(`/api/bursts?${params.toString()}`);
+      state.burstsTotal = res.total;
+      const startIdx = state.bursts.length;
+      state.bursts.push(...res.bursts);
+      state.burstsOffset += res.bursts.length;
+      if ($("burstsCountLabel")) {
+        $("burstsCountLabel").textContent = `${state.burstsTotal.toLocaleString()} bursts / scenarios`;
+      }
+      const frag = document.createDocumentFragment();
+      res.bursts.forEach((b, i) => frag.appendChild(createBurstRowEl(b, startIdx + i)));
+      $("burstsList").appendChild(frag);
+      $("burstsLoadMoreWrap").classList.toggle("hidden", state.bursts.length >= state.burstsTotal);
+    } catch (err) {
+      toast("Failed to load bursts: " + err.message);
+    } finally {
+      state.burstsLoading = false;
+    }
   }
 
-  function renderCompareGrid() {
-    const grid = $("compareGrid");
-    grid.innerHTML = "";
-    for (const img of state.compareItems) {
-      const spd = getSpeedInfo(img.exposure_seconds, img.exposure_time);
-      const url = state.compareShowCrop
-        ? `/api/media/crop/${encodeURIComponent(img.image_id)}`
-        : `/api/media/hq/${encodeURIComponent(img.image_id)}`;
-      const card = document.createElement("div");
-      card.className = "compare-card";
-      card.innerHTML = `
-        <div class="compare-img-wrap"><img src="${url}" alt="${escapeHtml(img.filename)}" /></div>
-        <div class="compare-footer">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <strong>${escapeHtml(img.filename)}</strong>
-            <span class="spd-badge ${spd.cls}">${spd.icon} ${escapeHtml(spd.text)}</span>
-          </div>
-          <div class="muted">
-            Score: <strong>${Math.round(img.overall_score || 0)}</strong> ·
-            Sharp: <strong>${Math.round(img.sharpness_score || 0)}</strong> ·
-            Eye: <strong>${Math.round(img.eye_contact_score || 0)}</strong>
-          </div>
-          <div style="display:flex;gap:6px;align-items:center">
-            ${[1, 2, 3, 4, 5].map((r) => `<button class="btn btn-xs ${img.effective_rating === r ? "btn-primary" : ""}" data-cr="${r}">${r}★</button>`).join("")}
-            <button class="btn btn-xs" data-cl="Green">🟢</button>
-            <button class="btn btn-xs" data-cl="Yellow">🟡</button>
-            <button class="btn btn-xs" data-cl="Red">🔴</button>
-          </div>
-        </div>
-      `;
-      card.querySelectorAll("[data-cr]").forEach((b) => {
-        b.onclick = async () => {
-          await setRating(img, Number(b.dataset.cr), false);
-          renderCompareGrid();
-        };
+  async function loadManualSplits(dirId) {
+    if (!dirId) return;
+    try {
+      const res = await api(`/api/bursts/splits/${dirId}`);
+      state.manualSplits = new Set(res.image_ids || []);
+    } catch (_) {}
+  }
+
+  async function splitBurstAt(imageId) {
+    if (!imageId) return;
+    try {
+      const res = await api("/api/bursts/split", {
+        method: "POST",
+        body: JSON.stringify({ image_id: imageId }),
       });
-      card.querySelectorAll("[data-cl]").forEach((b) => {
-        b.onclick = async () => {
-          await setColorLabel(img, b.dataset.cl, false);
-          renderCompareGrid();
-        };
-      });
-      grid.appendChild(card);
+      state.manualSplits.add(imageId);
+      state.expandedBursts.clear();
+      toast(`✂ Split ${res.orig_burst_id} → ${res.orig_burst_id} (${res.left_count}) + ${res.new_burst_id} (${res.right_count})`, 3000);
+      if (state.view === "bursts") {
+        await loadBursts(true);
+      } else if (state.view === "compare") {
+        await loadWvcBurst(res.new_burst_id, imageId);
+      } else if (state.view === "loupe") {
+        const cur = state.items[state.activeIndex];
+        if (cur && cur.image_id === imageId) {
+          cur.burst_id = res.new_burst_id;
+          cur.burst_index = 1;
+          cur.burst_size = res.right_count;
+        }
+        renderLoupe();
+      } else {
+        await loadImages(true);
+      }
+    } catch (err) {
+      toast("Split failed: " + err.message, 3500);
     }
+  }
+
+  async function unsplitBurstAt(imageId) {
+    if (!imageId) return;
+    try {
+      const res = await api("/api/bursts/unsplit", {
+        method: "POST",
+        body: JSON.stringify({ image_id: imageId }),
+      });
+      state.manualSplits.delete(imageId);
+      state.expandedBursts.clear();
+      toast(`🔗 Merged back into ${res.merged_burst_id} (${res.total_count} frames)`, 2800);
+      if (state.view === "bursts") {
+        await loadBursts(true);
+      } else if (state.view === "compare") {
+        await loadWvcBurst(res.merged_burst_id, imageId);
+      } else if (state.view === "loupe") {
+        const cur = state.items[state.activeIndex];
+        if (cur && cur.image_id === imageId) {
+          cur.burst_id = res.merged_burst_id;
+          cur.burst_size = res.total_count;
+        }
+        renderLoupe();
+      } else {
+        await loadImages(true);
+      }
+    } catch (err) {
+      toast("Merge failed: " + err.message, 3500);
+    }
+  }
+
+  function createBurstCardEl(img, burstObj) {
+    const lbl = img.effective_label || "";
+    const card = document.createElement("div");
+    card.className = "burst-card" + (lbl ? ` b-label-${lbl}` : " is-unselected");
+    card.dataset.id = img.image_id;
+    const tagTxt = lbl === "Green" ? "✓ EDIT" : (lbl === "Yellow" ? "✓ KEEP" : (lbl === "Red" ? "✕ DEL" : ""));
+    const canSplit = img.burst_size > 1 && img.burst_index > 1;
+    const canUnsplit = state.manualSplits.has(img.image_id);
+    card.innerHTML = `
+      <img class="burst-card-thumb" loading="lazy" decoding="async" src="/api/media/thumb/${encodeURIComponent(img.image_id)}" alt="${escapeHtml(img.filename)}" />
+      ${tagTxt ? `<span class="burst-pick-tag bpt-${lbl}">${tagTxt}</span>` : ""}
+      ${canSplit ? `<button class="card-split-btn" data-split-id="${escapeHtml(img.image_id)}" title="Split burst starting at #${img.burst_index}/${img.burst_size}">✂ Split</button>` : ""}
+      ${canUnsplit ? `<button class="card-split-btn merge-btn" data-unsplit-id="${escapeHtml(img.image_id)}" title="Merge this split burst back into previous burst">🔗 Merge</button>` : ""}
+      <div class="burst-card-info">
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">#${img.burst_index} ${escapeHtml(img.filename)}</span>
+        <span class="muted">S:${Math.round(img.sharpness_score || 0)}</span>
+      </div>
+    `;
+    const spBtn = card.querySelector("[data-split-id]");
+    if (spBtn) {
+      spBtn.onclick = (e) => { e.stopPropagation(); splitBurstAt(img.image_id); };
+    }
+    const unspBtn = card.querySelector("[data-unsplit-id]");
+    if (unspBtn) {
+      unspBtn.onclick = (e) => { e.stopPropagation(); unsplitBurstAt(img.image_id); };
+    }
+    card.onclick = (e) => {
+      e.stopPropagation();
+      // Open directly in Winner vs Challenger focused on this exact frame!
+      openWinnerVsChallengerForBurst(burstObj.burst_id, img.image_id);
+    };
+    return card;
+  }
+
+  function createBurstRowEl(b, idx) {
+    const row = document.createElement("div");
+    row.className = "burst-row" + (idx === state.activeBurstIdx ? " active-burst" : "");
+    row.dataset.burstId = b.burst_id;
+    row.dataset.burstIdx = String(idx);
+
+    const scenMap = { action_sequence: "🎬 Action", static_group: "📸 Static", single: "1️⃣ Single" };
+    const isExpanded = state.expandedBursts.has(b.burst_id);
+    const expandedItems = isExpanded ? state.expandedBursts.get(b.burst_id) : null;
+
+    row.innerHTML = `
+      <div class="burst-row-head">
+        <div class="burst-row-title">
+          <strong>${escapeHtml(b.burst_id)}</strong>
+          <span>${escapeHtml(b.subfolder)}</span>
+          ${b.species ? `<span class="badge">${escapeHtml(b.species)}</span>` : ""}
+          ${b.scenario_type ? `<span class="badge">${scenMap[b.scenario_type] || b.scenario_type}</span>` : ""}
+          <span class="muted">${b.count} frames · Best ${Math.round(b.max_score)}</span>
+          ${b.edit_count ? `<span class="badge badge-l2">🟢 ${b.edit_count} Edit</span>` : ""}
+          ${b.keep_count ? `<span class="badge badge-l1">🟡 ${b.keep_count} Keep</span>` : ""}
+          ${b.delete_count ? `<span class="badge badge-del">🔴 ${b.delete_count} Del</span>` : ""}
+          ${(!b.edit_count && !b.keep_count) ? `<span class="badge">0 selected</span>` : ""}
+        </div>
+        <div class="burst-row-actions">
+          <button class="btn btn-xs btn-primary" data-wvc-open="${escapeHtml(b.burst_id)}">◫ Winner vs Challenger</button>
+          ${b.count > 1 ? `<button class="btn btn-xs btn-ghost" data-burst-toggle="${escapeHtml(b.burst_id)}">${isExpanded ? "▲ Collapse" : `▼ Show All ${b.count}`}</button>` : ""}
+        </div>
+      </div>
+      <div class="burst-strip-grid"></div>
+    `;
+
+    const grid = row.querySelector(".burst-strip-grid");
+    if (isExpanded && expandedItems) {
+      expandedItems.forEach((img) => grid.appendChild(createBurstCardEl(img, b)));
+    } else {
+      const shown = b.selected_items.length > 0 ? b.selected_items : b.preview_others;
+      shown.forEach((img) => grid.appendChild(createBurstCardEl(img, b)));
+      const remaining = b.count - shown.length;
+      if (remaining > 0) {
+        const expTile = document.createElement("button");
+        expTile.className = "burst-expand-tile";
+        expTile.innerHTML = `<span>+ ${remaining} more frames</span><span class="muted">Click or Space to inspect all</span>`;
+        expTile.onclick = (e) => {
+          e.stopPropagation();
+          toggleExpandBurst(b, row);
+        };
+        grid.appendChild(expTile);
+      }
+    }
+
+    row.onclick = () => setActiveBurstIdx(idx);
+    row.querySelector("[data-wvc-open]").onclick = (e) => {
+      e.stopPropagation();
+      setActiveBurstIdx(idx);
+      openWinnerVsChallengerForBurst(b.burst_id);
+    };
+    const togBtn = row.querySelector("[data-burst-toggle]");
+    if (togBtn) {
+      togBtn.onclick = (e) => {
+        e.stopPropagation();
+        setActiveBurstIdx(idx);
+        toggleExpandBurst(b, row);
+      };
+    }
+    return row;
+  }
+
+  function setActiveBurstIdx(idx) {
+    if (idx < 0 || idx >= state.bursts.length) return;
+    state.activeBurstIdx = idx;
+    document.querySelectorAll(".burst-row.active-burst").forEach((el) => el.classList.remove("active-burst"));
+    const el = document.querySelector(`.burst-row[data-burst-idx="${idx}"]`);
+    if (el) {
+      el.classList.add("active-burst");
+      el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+    if (idx >= state.bursts.length - 8 && state.bursts.length < state.burstsTotal && !state.burstsLoading) {
+      loadBursts(false);
+    }
+  }
+
+  async function toggleExpandBurst(b, rowEl) {
+    if (state.expandedBursts.has(b.burst_id)) {
+      state.expandedBursts.delete(b.burst_id);
+    } else {
+      try {
+        const res = await api(`/api/bursts/${state.currentDirId}/${encodeURIComponent(b.burst_id)}`);
+        state.expandedBursts.set(b.burst_id, res.items || []);
+      } catch (err) {
+        toast("Failed to expand burst: " + err.message);
+        return;
+      }
+    }
+    const idx = Number(rowEl.dataset.burstIdx);
+    const fresh = createBurstRowEl(b, idx);
+    rowEl.replaceWith(fresh);
+  }
+
+  // ------------------------------------------------------------------
+  // #2 WINNER VS. CHALLENGER SPLIT-SCREEN COMPARE
+  // ------------------------------------------------------------------
+  async function openWinnerVsChallengerForBurst(burstId, focusImageId = "", pinnedWinnerId = "") {
+    if (!burstId) return;
+    state.wvcBurstId = burstId;
+    state.wvcReturnView = state.view === "compare" ? state.wvcReturnView : state.view;
+    state.view = "compare";
+    document.querySelectorAll(".view-switcher .btn-seg").forEach((b) => {
+      b.classList.toggle("active", b.dataset.view === "compare");
+    });
+    $("gridView").classList.add("hidden");
+    if ($("burstsView")) $("burstsView").classList.add("hidden");
+    $("loupeView").classList.add("hidden");
+    $("compareView").classList.remove("hidden");
+    await loadWvcBurst(burstId, focusImageId, pinnedWinnerId);
+  }
+
+  async function openCompareView() {
+    let targetBurstId = state.wvcBurstId;
+    let focusImgId = "";
+    if (state.wvcReturnView === "bursts" && state.bursts[state.activeBurstIdx]) {
+      targetBurstId = state.bursts[state.activeBurstIdx].burst_id;
+    } else if (state.items[state.activeIndex]?.burst_id) {
+      targetBurstId = state.items[state.activeIndex].burst_id;
+      focusImgId = state.items[state.activeIndex].image_id;
+    }
+    if (!targetBurstId && state.bursts.length > 0) {
+      targetBurstId = state.bursts[0].burst_id;
+    }
+    if (!targetBurstId) {
+      toast("Select a photo or burst to open Winner vs. Challenger.");
+      setView("grid");
+      return;
+    }
+    await loadWvcBurst(targetBurstId, focusImgId);
+  }
+
+  async function loadWvcBurst(burstId, focusImageId = "", pinnedWinnerId = "") {
+    try {
+      const sub = state.filters.subfolder === "__all__" ? "" : (state.filters.subfolder || "");
+      const q = sub ? `?subfolder=${encodeURIComponent(sub)}` : "";
+      const res = await api(`/api/bursts/${state.currentDirId}/${encodeURIComponent(burstId)}${q}`);
+      const frames = res.items || [];
+      if (!frames.length) {
+        toast("Burst has no frames.");
+        return;
+      }
+      state.wvcBurstId = burstId;
+      state.wvcFrames = frames;
+      state.wvcBurstPos = res.burst_pos || 0;
+      state.wvcTotalBursts = res.total_bursts || 0;
+      state.wvcFirstImgPos = res.first_image_pos || 0;
+      state.wvcTotalImgs = res.total_images || 0;
+
+      // Restore exact pinned winner if specified, else pick best Green -> Yellow -> highest score
+      let winIdx = pinnedWinnerId ? frames.findIndex((f) => f.image_id === pinnedWinnerId) : -1;
+      if (winIdx < 0) {
+        let bestScore = -1;
+        for (const tier of ["Green", "Yellow", ""]) {
+          frames.forEach((f, i) => {
+            const match = tier === "" || f.effective_label === tier;
+            if (match && (f.overall_score || 0) > bestScore) {
+              bestScore = f.overall_score || 0;
+              winIdx = i;
+            }
+          });
+          if (winIdx >= 0) break;
+        }
+      }
+      state.wvcWinnerIdx = Math.max(0, winIdx);
+
+      // Pick Challenger: clicked image if specified, else always start from the FIRST image (index 0)
+      let chalIdx = 0;
+      if (focusImageId) {
+        const fi = frames.findIndex((f) => f.image_id === focusImageId);
+        if (fi >= 0) chalIdx = fi;
+      }
+      state.wvcChalIdx = chalIdx;
+      state.wvcZoomed = false;
+      state.wvcScale = 3.2;
+      state.wvcPanX = 0;
+      state.wvcPanY = 0;
+      renderWvc();
+    } catch (err) {
+      toast("Failed to load burst: " + err.message);
+    }
+  }
+
+  function applyWvcZoomTransforms() {
+    const win = state.wvcFrames[state.wvcWinnerIdx];
+    const chal = state.wvcFrames[state.wvcChalIdx];
+    const pairs = [
+      { wrap: $("wvcLeftWrap"), imgEl: $("wvcWinImg"), rec: win },
+      { wrap: $("wvcRightWrap"), imgEl: $("wvcChalImg"), rec: chal },
+    ];
+    $("btnWvcZoomToggle").classList.toggle("active", state.wvcZoomed);
+    for (const p of pairs) {
+      if (!p.wrap || !p.imgEl) continue;
+      p.wrap.classList.toggle("zoomed", state.wvcZoomed);
+      if (!state.wvcZoomed || !p.rec) {
+        p.wrap.style.transform = "translate(0px, 0px) scale(1)";
+        continue;
+      }
+      const fc = getCameraFocusCenter(p.rec);
+      const fx = Math.max(0, Math.min(1, fc.x + state.wvcPanX));
+      const fy = Math.max(0, Math.min(1, fc.y + state.wvcPanY));
+      const bw = p.imgEl.offsetWidth || 1;
+      const bh = p.imgEl.offsetHeight || 1;
+      const sc = state.wvcScale || 3.2;
+      const tx = (0.5 - fx) * bw * sc;
+      const ty = (0.5 - fy) * bh * sc;
+      p.wrap.style.transform = `translate(${tx.toFixed(1)}px, ${ty.toFixed(1)}px) scale(${sc.toFixed(3)})`;
+    }
+  }
+
+  function renderWvcPaneControls(container, img) {
+    if (!container || !img) return;
+    container.innerHTML = `
+      <div style="display:flex;align-items:center;gap:6px">
+        <div class="star-picker">
+          ${[1, 2, 3, 4, 5].map((r) => `<button class="star-btn ${r <= (img.effective_rating || 0) ? "on" : ""}" data-wr="${r}">★</button>`).join("")}
+        </div>
+        <div class="color-picker">
+          ${COLORS.map((c) => `<button class="cp-dot ${c.css} ${(img.effective_label || "") === c.key ? "active" : ""}" data-wl="${c.key}" title="${c.name}">${c.key ? "" : "∅"}</button>`).join("")}
+        </div>
+      </div>
+      <span class="muted">Overall: <strong>${Math.round(img.overall_score || 0)}</strong> · Sharp: <strong>${Math.round(img.sharpness_score || 0)}</strong> · Eye: <strong>${Math.round(img.eye_contact_score || 0)}</strong></span>
+    `;
+    container.querySelectorAll("[data-wr]").forEach((b) => {
+      b.onclick = async () => {
+        const r = Number(b.dataset.wr);
+        await setRating(img, img.effective_rating === r ? 0 : r, false);
+        renderWvc();
+      };
+    });
+    container.querySelectorAll("[data-wl]").forEach((b) => {
+      b.onclick = async () => {
+        await setColorLabel(img, b.dataset.wl, false);
+        renderWvc();
+      };
+    });
+  }
+
+  function renderWvc() {
+    const frames = state.wvcFrames;
+    if (!frames.length) return;
+    const win = frames[state.wvcWinnerIdx] || frames[0];
+    const chal = frames[state.wvcChalIdx] || frames[0];
+
+    const greenCnt = frames.filter((f) => f.effective_label === "Green").length;
+    const yellowCnt = frames.filter((f) => f.effective_label === "Yellow").length;
+    $("compareTitle").textContent = `${state.wvcBurstId} · ${frames.length} frames (${greenCnt} Green, ${yellowCnt} Yellow)`;
+
+    // Burst counter (current / total bursts)
+    const bCtr = $("compareBurstCounter");
+    if (bCtr) {
+      const bIdx = state.bursts.findIndex((b) => b.burst_id === state.wvcBurstId);
+      const bCur = bIdx >= 0 ? (bIdx + 1) : state.wvcBurstPos;
+      const bTot = (bIdx >= 0 && state.burstsTotal > 0) ? state.burstsTotal : state.wvcTotalBursts;
+      bCtr.textContent = bTot > 0 ? `Burst ${bCur.toLocaleString()} / ${bTot.toLocaleString()}` : "Burst —";
+    }
+
+    // Image counter (current Challenger / total filtered or directory images)
+    const iCtr = $("compareImageCounter");
+    if (iCtr) {
+      const filteredIdx = state.items.findIndex((it) => it.image_id === chal.image_id);
+      if (filteredIdx >= 0) {
+        const tot = state.total || state.items.length;
+        iCtr.textContent = `Image ${(filteredIdx + 1).toLocaleString()} / ${tot.toLocaleString()}`;
+      } else if (state.wvcFirstImgPos > 0 && state.wvcTotalImgs > 0) {
+        iCtr.textContent = `Image ${(state.wvcFirstImgPos + state.wvcChalIdx).toLocaleString()} / ${state.wvcTotalImgs.toLocaleString()}`;
+      } else {
+        iCtr.textContent = `Frame ${state.wvcChalIdx + 1} / ${frames.length}`;
+      }
+    }
+
+    const deltaSharp = (chal.sharpness_score || 0) - (win.sharpness_score || 0);
+    const db = $("compareDeltaBadge");
+    if (win.image_id === chal.image_id) {
+      db.textContent = "Same frame";
+      db.style.color = "#cbd5e1";
+    } else if (deltaSharp >= 0) {
+      db.textContent = `Challenger +${deltaSharp.toFixed(1)} sharper`;
+      db.style.color = "#4ade80";
+    } else {
+      db.textContent = `Winner +${Math.abs(deltaSharp).toFixed(1)} sharper`;
+      db.style.color = "#fbbf24";
+    }
+
+    // Pane border highlights
+    const lp = $("wvcLeftPane");
+    const rp = $("wvcRightPane");
+    lp.className = "wvc-pane" + (win.effective_label ? ` wvc-${win.effective_label.toLowerCase()}` : "");
+    rp.className = "wvc-pane" + (chal.effective_label ? ` wvc-${chal.effective_label.toLowerCase()}` : "");
+
+    $("wvcWinName").textContent = win.filename;
+    $("wvcWinMeta").textContent = `${win.effective_label || "None"} · ${win.exposure_time || ""}`;
+    $("wvcChalName").textContent = chal.filename;
+    $("wvcChalMeta").textContent = `${chal.effective_label || "None"} · ${chal.exposure_time || ""}`;
+    if ($("btnWvcSplitHere")) {
+      $("btnWvcSplitHere").classList.toggle("hidden", !(frames.length > 1 && state.wvcChalIdx > 0));
+    }
+    if ($("btnWvcUnsplitHere")) {
+      $("btnWvcUnsplitHere").classList.toggle("hidden", !state.manualSplits.has(chal.image_id));
+    }
+
+    const winUrl = state.wvcZoomed ? getZoomMediaUrl(win.image_id) : `/api/media/hq/${encodeURIComponent(win.image_id)}`;
+    const chalUrl = state.wvcZoomed ? getZoomMediaUrl(chal.image_id) : `/api/media/hq/${encodeURIComponent(chal.image_id)}`;
+    const wi = $("wvcWinImg");
+    const ci = $("wvcChalImg");
+    wi.onload = () => applyWvcZoomTransforms();
+    ci.onload = () => applyWvcZoomTransforms();
+    applyImageColorFrame(wi, win.effective_label);
+    applyImageColorFrame(ci, chal.effective_label);
+    if (wi.dataset.loadedUrl !== winUrl) {
+      wi.dataset.loadedUrl = winUrl;
+      wi.src = winUrl;
+    }
+    if (ci.dataset.loadedUrl !== chalUrl) {
+      ci.dataset.loadedUrl = chalUrl;
+      ci.src = chalUrl;
+    }
+    applyWvcZoomTransforms();
+
+    renderWvcPaneControls($("wvcWinControls"), win);
+    renderWvcPaneControls($("wvcChalControls"), chal);
+
+    // Fetch AF points for both frames if missing so synced focus zoom centers on bird eye!
+    for (const f of [win, chal]) {
+      if (f.af_points === null || f.af_points === undefined) {
+        api(`/api/images/${encodeURIComponent(f.image_id)}`).then((r) => {
+          if (r.image) f.af_points = r.image.af_points || [];
+          if (state.wvcZoomed) applyWvcZoomTransforms();
+        }).catch(() => {});
+      }
+    }
+
+    // Show/hide prev & next arrows at the burst boundaries (no endless wrap-around)
+    if ($("btnWvcChalPrev")) $("btnWvcChalPrev").classList.toggle("hidden", state.wvcChalIdx <= 0);
+    if ($("btnWvcChalNext")) $("btnWvcChalNext").classList.toggle("hidden", state.wvcChalIdx >= frames.length - 1);
+
+    // Render Color-Coded Burst Filmstrip
+    $("wvcStripPos").textContent = `Frame ${state.wvcChalIdx + 1} / ${frames.length}`;
+    const strip = $("wvcFilmstrip");
+    strip.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    frames.forEach((f, i) => {
+      const div = document.createElement("div");
+      const lblCls = f.effective_label ? ` fs-label-${f.effective_label}` : "";
+      const pinCls = i === state.wvcWinnerIdx ? " fs-pinned" : "";
+      div.className = "fs-item" + lblCls + pinCls + (i === state.wvcChalIdx ? " active" : "");
+      div.title = `${f.filename} · ${f.effective_label || "Unselected"} · Sharp: ${Math.round(f.sharpness_score || 0)}`;
+      div.innerHTML = `
+        <img loading="lazy" decoding="async" src="/api/media/thumb/${encodeURIComponent(f.image_id)}" alt="" />
+        <div class="fs-sharp-bar" style="width:${Math.min(100, f.sharpness_score || 0)}%"></div>
+        ${f.effective_rating ? `<span class="fs-star-mini">${"★".repeat(f.effective_rating)}</span>` : ""}
+      `;
+      div.onclick = () => {
+        state.wvcChalIdx = i;
+        renderWvc();
+      };
+      frag.appendChild(div);
+    });
+    strip.appendChild(frag);
+    const actEl = strip.querySelector(".fs-item.active");
+    if (actEl) actEl.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+    scheduleSessionSave();
+  }
+
+  function stepWvcChallenger(delta) {
+    const n = state.wvcFrames.length;
+    if (n <= 1) return;
+    const next = state.wvcChalIdx + delta;
+    if (next < 0 || next >= n) return;
+    state.wvcChalIdx = next;
+    renderWvc();
+  }
+
+  async function wvcSwapWinner() {
+    const win = state.wvcFrames[state.wvcWinnerIdx];
+    const chal = state.wvcFrames[state.wvcChalIdx];
+    if (!win || !chal || win.image_id === chal.image_id) return;
+    const winColor = (win.effective_label === "Green" || win.effective_label === "Yellow") ? win.effective_label : "Green";
+    const demoteColor = winColor === "Green" ? "Yellow" : "";
+    await setColorLabel(chal, winColor, false);
+    await setColorLabel(win, demoteColor, false);
+    state.wvcWinnerIdx = state.wvcChalIdx;
+    renderWvc();
+    toast(`Swapped Winner! ${chal.filename} → ${winColor}, ${win.filename} → ${demoteColor || "None"}`);
+  }
+
+  async function wvcKeepBoth() {
+    const win = state.wvcFrames[state.wvcWinnerIdx];
+    const chal = state.wvcFrames[state.wvcChalIdx];
+    if (!win || !chal) return;
+    const winColor = (win.effective_label === "Green" || win.effective_label === "Yellow") ? win.effective_label : "Green";
+    await setColorLabel(chal, winColor, false);
+    renderWvc();
+    toast(`Kept Both! ${chal.filename} → ${winColor}`);
+  }
+
+  async function wvcStepBurst(delta) {
+    if (!state.bursts.length) {
+      await loadBursts(true);
+    }
+    let idx = state.bursts.findIndex((b) => b.burst_id === state.wvcBurstId);
+    if (idx < 0) idx = state.activeBurstIdx;
+    const nextIdx = idx + delta;
+    if (nextIdx < 0 || nextIdx >= state.bursts.length) {
+      toast(delta > 0 ? "Reached last loaded burst" : "Already at first burst");
+      return;
+    }
+    state.activeBurstIdx = nextIdx;
+    if (nextIdx >= state.bursts.length - 5 && state.bursts.length < state.burstsTotal) {
+      loadBursts(false);
+    }
+    await loadWvcBurst(state.bursts[nextIdx].burst_id);
   }
 
   // ------------------------------------------------------------------
@@ -1742,8 +2392,15 @@
       });
       toast(res.message || "Undone");
       if (res.ok) {
-        await loadImages(true);
-        if (state.view === "loupe") renderLoupe();
+        await refreshSidebarCounts();
+        if (state.view === "compare" && state.wvcBurstId) {
+          const curWinId = state.wvcFrames[state.wvcWinnerIdx]?.image_id || "";
+          const curChalId = state.wvcFrames[state.wvcChalIdx]?.image_id || "";
+          await loadWvcBurst(state.wvcBurstId, curChalId, curWinId);
+        } else {
+          await loadImages(true);
+          if (state.view === "loupe") renderLoupe();
+        }
       }
     } catch (err) {
       toast("Undo failed: " + err.message);
@@ -1828,10 +2485,10 @@
     const rj = m.rejected || { enabled: false, rating: null, label: "" };
     const dl = m.to_delete || { enabled: true, rating: null, label: "Red" };
     $("mapL2Enabled").checked = !!l2.enabled;
-    $("mapL2Rating").value = l2.rating != null ? String(l2.rating) : "0";
+    $("mapL2Rating").value = l2.rating != null ? String(l2.rating) : "";
     $("mapL2Label").value = l2.label ?? "Green";
     $("mapL1Enabled").checked = !!l1.enabled;
-    $("mapL1Rating").value = l1.rating != null ? String(l1.rating) : "0";
+    $("mapL1Rating").value = l1.rating != null ? String(l1.rating) : "";
     $("mapL1Label").value = l1.label ?? "Yellow";
     $("mapRejEnabled").checked = !!rj.enabled;
     $("mapRejRating").value = rj.rating != null ? String(rj.rating) : "";
@@ -1847,6 +2504,123 @@
     if ($("setZoomQuality")) $("setZoomQuality").value = s.zoom_preview_quality || 94;
     $("aiXmpStatusMsg").textContent = "";
     $("modalSettings").classList.remove("hidden");
+    loadVersionInfo().catch(() => {});
+    renderUpdateUi();
+  }
+
+  async function loadVersionInfo() {
+    try {
+      state.versionInfo = await api("/api/system/version");
+      renderUpdateUi();
+    } catch (_) {
+      // Fail silently
+    }
+  }
+
+  function renderUpdateUi() {
+    const vi = state.versionInfo;
+    const ui = state.updateInfo;
+    const curVer = (ui && ui.current_version) || (vi && vi.current_version) || "";
+    if ($("setCurrentVersion")) {
+      $("setCurrentVersion").textContent = curVer ? `v${curVer}` : "v—";
+    }
+    const relUrl = (ui && ui.html_url) || (vi && vi.releases_url);
+    if ($("setReleasesLink") && relUrl) {
+      $("setReleasesLink").href = relUrl;
+    }
+    const installBtn = $("btnInstallUpdate");
+    if (installBtn) {
+      const avail = !!(ui && ui.update_available && ui.download_url);
+      installBtn.disabled = !avail || state.updatingApp;
+      installBtn.textContent = state.updatingApp
+        ? "⏳ Updating..."
+        : (avail ? `⬇ Install v${ui.latest_version}` : "⬇ Install Update");
+    }
+    if ($("setChangelogSummary")) {
+      $("setChangelogSummary").textContent = (ui && ui.update_available)
+        ? `What's New in v${ui.latest_version}`
+        : "What's New / Changelog";
+    }
+    if ($("setChangelogBody")) {
+      const notes = (ui && ui.update_available && ui.changelog)
+        ? ui.changelog
+        : ((vi && vi.changelog) || "No changelog available.");
+      $("setChangelogBody").textContent = notes;
+    }
+  }
+
+  async function checkAppUpdates(manual = false) {
+    const statusEl = $("updateStatusMsg");
+    if (manual && statusEl) statusEl.textContent = "Checking GitHub Releases...";
+    try {
+      const res = await api("/api/system/update-check");
+      state.updateInfo = res;
+      renderUpdateUi();
+      if (res.ok && res.update_available) {
+        const banner = $("updateBanner");
+        if (banner) {
+          const label = res.release_name && res.release_name !== `v${res.latest_version}`
+            ? `Update v${res.latest_version} available — ${res.release_name}`
+            : `Update v${res.latest_version} available (current: v${res.current_version})`;
+          if ($("updateBannerText")) $("updateBannerText").textContent = label;
+          banner.classList.remove("hidden");
+        }
+        if (statusEl) statusEl.textContent = `New version v${res.latest_version} is available!`;
+      } else if (manual && statusEl) {
+        statusEl.textContent = res.ok
+          ? (res.error || `You're up to date (v${res.current_version}).`)
+          : (res.error || "Could not check for updates.");
+      }
+    } catch (err) {
+      if (manual && statusEl) statusEl.textContent = `Update check failed: ${err.message}`;
+    }
+  }
+
+  async function installAppUpdate() {
+    if (state.updatingApp) return;
+    const ui = state.updateInfo;
+    const verLbl = ui?.latest_version ? `v${ui.latest_version}` : "the latest version";
+    if (!confirm(`Install ${verLbl}?\n\nYour photos, studio_data/ database, cull_output/, models/, and .env are strictly protected. You will need to restart ImageCulling Studio after the update completes.`)) {
+      return;
+    }
+    state.updatingApp = true;
+    renderUpdateUi();
+    const statusEl = $("updateStatusMsg");
+    if (statusEl) statusEl.textContent = "Downloading and applying update...";
+    const bannerBtn = $("btnBannerUpdateNow");
+    if (bannerBtn) { bannerBtn.disabled = true; bannerBtn.textContent = "⏳ Updating..."; }
+    try {
+      const res = await api("/api/system/update-apply", {
+        method: "POST",
+        body: JSON.stringify({ download_url: ui?.download_url || null }),
+      });
+      if (res.ok && res.updated) {
+        const msg = res.message || `Updated to v${res.new_version}. Please restart ImageCulling Studio.`;
+        if (statusEl) statusEl.textContent = msg;
+        toast(msg, 8000);
+        if ($("updateBannerText")) $("updateBannerText").textContent = `✅ ${msg}`;
+        if (bannerBtn) bannerBtn.classList.add("hidden");
+        await loadVersionInfo();
+      } else if (res.ok && !res.updated) {
+        const msg = res.message || "Already up to date.";
+        if (statusEl) statusEl.textContent = msg;
+        toast(msg, 3500);
+      } else {
+        const errMsg = res.error || "Update failed.";
+        if (statusEl) statusEl.textContent = errMsg;
+        toast("Update failed: " + errMsg, 6000);
+      }
+    } catch (err) {
+      if (statusEl) statusEl.textContent = "Update failed: " + err.message;
+      toast("Update failed: " + err.message, 6000);
+    } finally {
+      state.updatingApp = false;
+      if (bannerBtn && !bannerBtn.classList.contains("hidden")) {
+        bannerBtn.disabled = false;
+        bannerBtn.textContent = "Update Now";
+      }
+      renderUpdateUi();
+    }
   }
 
   function gatherSettingsForm() {
@@ -1858,12 +2632,12 @@
       ai_xmp_mapping: {
         layer2_to_edit: {
           enabled: $("mapL2Enabled").checked,
-          rating: Number($("mapL2Rating").value),
+          rating: $("mapL2Rating").value === "" ? null : Number($("mapL2Rating").value),
           label: $("mapL2Label").value,
         },
         layer1_keep: {
           enabled: $("mapL1Enabled").checked,
-          rating: Number($("mapL1Rating").value),
+          rating: $("mapL1Rating").value === "" ? null : Number($("mapL1Rating").value),
           label: $("mapL1Label").value,
         },
         rejected: {
@@ -1879,8 +2653,8 @@
       },
       hq_preview_max_dim: Number($("setHqDim").value) || 1600,
       hq_preview_quality: Number($("setHqQuality").value) || 86,
-      zoom_preview_max_dim: Number($("setZoomDim")?.value) || 3072,
-      zoom_preview_quality: Number($("setZoomQuality")?.value) || 88,
+      zoom_preview_max_dim: Number($("setZoomDim")?.value) || 8192,
+      zoom_preview_quality: Number($("setZoomQuality")?.value) || 94,
     };
   }
 
@@ -2072,6 +2846,11 @@
         toast(err.message, 4500);
       }
     };
+
+    // Welcome card Open Folder CTA
+    if ($("btnWelcomeOpenDir")) {
+      $("btnWelcomeOpenDir").onclick = () => $("btnOpenDir").click();
+    }
 
     // Directory switcher
     $("dirSelect").onchange = (e) => {
@@ -2348,6 +3127,18 @@
       }
     });
     $("btnLoupeCompareBurst").onclick = () => setView("compare");
+    if ($("btnLoupeSplitBurst")) {
+      $("btnLoupeSplitBurst").onclick = () => {
+        const cur = state.items[state.activeIndex];
+        if (cur) splitBurstAt(cur.image_id);
+      };
+    }
+    if ($("btnLoupeUnsplitBurst")) {
+      $("btnLoupeUnsplitBurst").onclick = () => {
+        const cur = state.items[state.activeIndex];
+        if (cur) unsplitBurstAt(cur.image_id);
+      };
+    }
     $("btnFlagPick").onclick = () => setUserFlag(state.items[state.activeIndex], 1);
     $("btnFlagReject").onclick = () => setUserFlag(state.items[state.activeIndex], -1);
 
@@ -2359,12 +3150,131 @@
       };
     });
 
-    // Compare buttons
-    $("btnCompareToggleCrop").onclick = () => {
-      state.compareShowCrop = !state.compareShowCrop;
-      renderCompareGrid();
-    };
-    $("btnCompareExit").onclick = () => setView("grid");
+    // #1 Burst-by-Burst view controls
+    document.querySelectorAll("#burstFilterBar .rop-btn").forEach((b) => {
+      b.onclick = () => {
+        state.burstFilter = b.dataset.bf;
+        document.querySelectorAll("#burstFilterBar .rop-btn").forEach((x) => x.classList.toggle("active", x === b));
+        loadBursts(true);
+      };
+    });
+    if ($("burstSortSelect")) {
+      $("burstSortSelect").onchange = (e) => {
+        state.burstSort = e.target.value;
+        loadBursts(true);
+      };
+    }
+    if ($("btnLoadMoreBursts")) $("btnLoadMoreBursts").onclick = () => loadBursts(false);
+    if ($("burstsView")) {
+      $("burstsView").addEventListener("scroll", () => {
+        const el = $("burstsView");
+        if (state.view === "bursts" && el.scrollTop + el.clientHeight >= el.scrollHeight - 1200 && state.bursts.length < state.burstsTotal) {
+          loadBursts(false);
+        }
+      }, { passive: true });
+    }
+
+    // #2 Winner vs Challenger buttons
+    if ($("btnWvcPrevBurst")) $("btnWvcPrevBurst").onclick = () => wvcStepBurst(-1);
+    if ($("btnWvcNextBurst")) $("btnWvcNextBurst").onclick = () => wvcStepBurst(1);
+    if ($("btnWvcChalPrev")) $("btnWvcChalPrev").onclick = () => stepWvcChallenger(-1);
+    if ($("btnWvcChalNext")) $("btnWvcChalNext").onclick = () => stepWvcChallenger(1);
+    if ($("btnWvcZoomToggle")) {
+      $("btnWvcZoomToggle").onclick = () => {
+        state.wvcZoomed = !state.wvcZoomed;
+        state.wvcPanX = 0;
+        state.wvcPanY = 0;
+        if (state.wvcZoomed) state.wvcScale = 3.2;
+        renderWvc();
+      };
+    }
+    // Synced mouse-drag panning & mouse-wheel zoom across BOTH Winner & Challenger panes
+    for (const stageId of ["wvcLeftStage", "wvcRightStage"]) {
+      const stEl = $(stageId);
+      if (!stEl) continue;
+      stEl.addEventListener("mousedown", (e) => {
+        if (e.button !== 0 || e.target.closest("button")) return;
+        e.preventDefault();
+        state.wvcDragging = true;
+        state.wvcDragMoved = false;
+        state.wvcDragStartX = e.clientX;
+        state.wvcDragStartY = e.clientY;
+        state.wvcDragStartPanX = state.wvcPanX;
+        state.wvcDragStartPanY = state.wvcPanY;
+        if (state.wvcZoomed) {
+          $("wvcLeftWrap")?.classList.add("dragging");
+          $("wvcRightWrap")?.classList.add("dragging");
+        }
+      });
+      stEl.addEventListener("wheel", (e) => {
+        if (state.view !== "compare") return;
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? 1.22 : 1 / 1.22;
+        const wasZoomed = state.wvcZoomed;
+        const nextScale = Math.max(1.0, Math.min(8.0, (wasZoomed ? state.wvcScale : 1.0) * factor));
+        if (nextScale <= 1.05) {
+          state.wvcZoomed = false;
+          state.wvcScale = 3.2;
+          state.wvcPanX = 0;
+          state.wvcPanY = 0;
+          renderWvc();
+        } else {
+          state.wvcScale = nextScale;
+          if (!wasZoomed) {
+            state.wvcZoomed = true;
+            renderWvc();
+          } else {
+            applyWvcZoomTransforms();
+          }
+        }
+      }, { passive: false });
+    }
+    window.addEventListener("mousemove", (e) => {
+      if (!state.wvcDragging) return;
+      const dx = e.clientX - state.wvcDragStartX;
+      const dy = e.clientY - state.wvcDragStartY;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) state.wvcDragMoved = true;
+      if (state.wvcZoomed && state.wvcDragMoved) {
+        const refImg = $("wvcWinImg") || $("wvcChalImg");
+        const bw = (refImg && refImg.offsetWidth) || 500;
+        const bh = (refImg && refImg.offsetHeight) || 350;
+        const sc = state.wvcScale || 3.2;
+        state.wvcPanX = Math.max(-0.5, Math.min(0.5, state.wvcDragStartPanX - dx / (bw * sc)));
+        state.wvcPanY = Math.max(-0.5, Math.min(0.5, state.wvcDragStartPanY - dy / (bh * sc)));
+        applyWvcZoomTransforms();
+      }
+    });
+    window.addEventListener("mouseup", () => {
+      if (!state.wvcDragging) return;
+      state.wvcDragging = false;
+      $("wvcLeftWrap")?.classList.remove("dragging");
+      $("wvcRightWrap")?.classList.remove("dragging");
+      if (!state.wvcDragMoved && state.view === "compare") {
+        $("btnWvcZoomToggle").click();
+      }
+    });
+    if ($("btnWvcSwap")) $("btnWvcSwap").onclick = () => wvcSwapWinner();
+    if ($("btnWvcKeepBoth")) $("btnWvcKeepBoth").onclick = () => wvcKeepBoth();
+    if ($("btnWvcPinChallenger")) {
+      $("btnWvcPinChallenger").onclick = () => {
+        state.wvcWinnerIdx = state.wvcChalIdx;
+        renderWvc();
+        toast("Pinned Challenger as Winner on Left");
+      };
+    }
+    if ($("btnWvcSplitHere")) {
+      $("btnWvcSplitHere").onclick = () => {
+        const chal = state.wvcFrames[state.wvcChalIdx];
+        if (chal) splitBurstAt(chal.image_id);
+      };
+    }
+    if ($("btnWvcUnsplitHere")) {
+      $("btnWvcUnsplitHere").onclick = () => {
+        const chal = state.wvcFrames[state.wvcChalIdx];
+        if (chal) unsplitBurstAt(chal.image_id);
+      };
+    }
+    $("btnCompareExit").onclick = () => setView(state.wvcReturnView || "grid");
 
     // Topbar utility buttons
     $("btnUndo").onclick = () => undoLast();
@@ -2372,6 +3282,15 @@
     $("btnLearning").onclick = () => openLearningModal();
     $("btnSettings").onclick = () => openSettingsModal();
     $("btnShortcuts").onclick = () => $("modalShortcuts").classList.remove("hidden");
+    document.querySelectorAll("#helpModalTabs .m-tab").forEach((b) => {
+      b.onclick = () => {
+        const tab = b.dataset.helpTab;
+        document.querySelectorAll("#helpModalTabs .m-tab").forEach((x) => x.classList.toggle("active", x === b));
+        $("helpTabGuide")?.classList.toggle("hidden", tab !== "guide");
+        $("helpTabShortcuts")?.classList.toggle("hidden", tab !== "shortcuts");
+        $("helpTabAi")?.classList.toggle("hidden", tab !== "ai");
+      };
+    });
 
     // Settings modal save & AI XMP sync
     $("btnSaveSettings").onclick = async () => {
@@ -2407,6 +3326,22 @@
       await loadImages(true);
     };
 
+    // Update banner & Settings "Version & Updates" buttons
+    if ($("btnBannerDismiss")) $("btnBannerDismiss").onclick = () => $("updateBanner")?.classList.add("hidden");
+    if ($("btnBannerWhatsNew")) {
+      $("btnBannerWhatsNew").onclick = async () => {
+        await openSettingsModal();
+        const det = $("setChangelogDetails");
+        if (det) {
+          det.open = true;
+          det.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+      };
+    }
+    if ($("btnBannerUpdateNow")) $("btnBannerUpdateNow").onclick = () => installAppUpdate();
+    if ($("btnCheckUpdates")) $("btnCheckUpdates").onclick = () => checkAppUpdates(true);
+    if ($("btnInstallUpdate")) $("btnInstallUpdate").onclick = () => installAppUpdate();
+
     // Logs modal tabs & filters
     document.querySelectorAll("#modalLogs .m-tab").forEach((b) => {
       b.onclick = () => switchLogTab(b.dataset.logTab);
@@ -2425,14 +3360,31 @@
       s.addEventListener("change", () => s.blur());
     });
 
+    function getPressedDigit(e) {
+      if (e.code && /^Digit[0-9]$/.test(e.code)) return Number(e.code.slice(5));
+      if (e.code && /^Numpad[0-9]$/.test(e.code)) return Number(e.code.slice(6));
+      if (typeof e.key === "string" && /^[0-9]$/.test(e.key)) return Number(e.key);
+      const kc = e.keyCode || e.which || 0;
+      if (kc >= 48 && kc <= 57) return kc - 48;
+      if (kc >= 96 && kc <= 105) return kc - 96;
+      return -1;
+    }
+
     // Global Keyboard Shortcuts (Lightroom / Photo Mechanic style)
     window.addEventListener("keydown", (e) => {
       const target = e.target;
       const tag = (target?.tagName || "").toLowerCase();
       const inputType = (target?.type || "").toLowerCase();
+      const pressedDigit = getPressedDigit(e);
       // Only block shortcuts when typing inside text/search/number inputs or textareas (NOT checkboxes or buttons!)
       if (tag === "textarea" || (tag === "input" && !["checkbox", "radio", "range", "button"].includes(inputType))) return;
-      if (tag === "select" && e.key !== "Escape") return;
+      if (tag === "select" && e.key !== "Escape") {
+        if (pressedDigit >= 0 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          target.blur();
+        } else {
+          return;
+        }
+      }
 
       if ((e.ctrlKey || e.metaKey) && (e.code === "KeyZ" || e.key.toLowerCase() === "z")) {
         e.preventDefault();
@@ -2461,7 +3413,8 @@
 
       if (e.key === "Escape") {
         document.querySelectorAll(".modal-backdrop").forEach((m) => m.classList.add("hidden"));
-        if (state.view !== "grid") setView("grid");
+        if (state.view === "compare") setView(state.wvcReturnView || "grid");
+        else if (state.view !== "grid") setView("grid");
         return;
       }
 
@@ -2470,9 +3423,62 @@
       const k = e.key.toLowerCase();
       if (!e.ctrlKey && !e.metaKey && !e.altKey) {
         if (code === "KeyG" || k === "g") { setView("grid"); return; }
+        if (code === "KeyM" || k === "m") { setView("bursts"); return; }
         if (code === "KeyE" || k === "e") { setView("loupe"); return; }
         if (code === "KeyC" || k === "c") { setView("compare"); return; }
         if (e.key === "?") { $("modalShortcuts").classList.toggle("hidden"); return; }
+      }
+
+      // Burst-by-Burst keyboard navigation (↑/↓ jump bursts, Space expand, Enter Winner vs Challenger)
+      if (state.view === "bursts") {
+        if (e.key === "ArrowDown") { e.preventDefault(); setActiveBurstIdx(state.activeBurstIdx + 1); return; }
+        if (e.key === "ArrowUp") { e.preventDefault(); setActiveBurstIdx(state.activeBurstIdx - 1); return; }
+        if (code === "Space" || e.key === " ") {
+          e.preventDefault();
+          const b = state.bursts[state.activeBurstIdx];
+          const row = document.querySelector(`.burst-row[data-burst-idx="${state.activeBurstIdx}"]`);
+          if (b && row) toggleExpandBurst(b, row);
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const b = state.bursts[state.activeBurstIdx];
+          if (b) openWinnerVsChallengerForBurst(b.burst_id);
+          return;
+        }
+      }
+
+      // Winner vs Challenger keyboard shortcuts (←/→ challengers, ↑/↓ bursts, Z zoom, S swap, K keep both, 0-9 rate/color Challenger)
+      if (state.view === "compare") {
+        const chal = state.wvcFrames[state.wvcChalIdx];
+        if (e.key === "ArrowRight") { e.preventDefault(); stepWvcChallenger(1); return; }
+        if (e.key === "ArrowLeft") { e.preventDefault(); stepWvcChallenger(-1); return; }
+        if (e.key === "ArrowDown") { e.preventDefault(); wvcStepBurst(1); return; }
+        if (e.key === "ArrowUp") { e.preventDefault(); wvcStepBurst(-1); return; }
+        if (code === "KeyZ" || k === "z" || code === "Space" || e.key === " ") {
+          e.preventDefault();
+          $("btnWvcZoomToggle").click();
+          return;
+        }
+        if (code === "KeyS" || k === "s") { e.preventDefault(); wvcSwapWinner(); return; }
+        if (code === "KeyK" || k === "k") { e.preventDefault(); wvcKeepBoth(); return; }
+        if (chal && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          if (pressedDigit >= 0 && pressedDigit <= 5) {
+            e.preventDefault();
+            toast(`${chal.filename} → ${pressedDigit}★`, 1100);
+            setRating(chal, pressedDigit, false).then(() => renderWvc());
+            return;
+          }
+          const colorByDigit = { 6: "Red", 7: "Yellow", 8: "Green", 9: "Blue" };
+          const cTarget = colorByDigit[pressedDigit] || ((code === "KeyP" || k === "p") ? "Purple" : "");
+          if (cTarget) {
+            e.preventDefault();
+            const nextLbl = chal.effective_label === cTarget ? "" : cTarget;
+            toast(`${chal.filename} → ${nextLbl || "No Color"}`, 1100);
+            setColorLabel(chal, nextLbl, false).then(() => renderWvc());
+            return;
+          }
+        }
       }
 
       const activeImg = state.items[state.activeIndex];
@@ -2514,51 +3520,58 @@
         }
       } else if (code === "KeyB" || k === "b") {
         if (state.view === "loupe") $("btnToggleBbox").click();
-      } else if (
-        ["Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Numpad0", "Numpad1", "Numpad2", "Numpad3", "Numpad4", "Numpad5"].includes(code) ||
-        ["0", "1", "2", "3", "4", "5"].includes(e.key)
-      ) {
+      } else if (code === "KeyS" || k === "s") {
+        if (state.view === "loupe" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          if (activeImg.burst_size > 1 && activeImg.burst_index > 1) {
+            splitBurstAt(activeImg.image_id);
+          } else if (state.manualSplits.has(activeImg.image_id)) {
+            unsplitBurstAt(activeImg.image_id);
+          } else {
+            toast("Already frame 1 of this burst", 1400);
+          }
+        }
+      } else if (pressedDigit >= 0 && pressedDigit <= 5) {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
-        const digit = ["0", "1", "2", "3", "4", "5"].includes(e.key) ? Number(e.key) : Number(code.slice(-1));
-        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ rating: digit });
-        else setRating(activeImg, digit);
-      } else if (code === "Digit6" || code === "Numpad6" || e.key === "6") {
+        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ rating: pressedDigit });
+        else { toast(`${activeImg.filename} → ${pressedDigit}★`, 1100); setRating(activeImg, pressedDigit); }
+      } else if (pressedDigit === 6) {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
         const nextLbl = activeImg.effective_label === "Red" ? "" : "Red";
         if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Red" });
-        else setColorLabel(activeImg, nextLbl);
-      } else if (code === "Digit7" || code === "Numpad7" || e.key === "7") {
+        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
+      } else if (pressedDigit === 7) {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
         const nextLbl = activeImg.effective_label === "Yellow" ? "" : "Yellow";
         if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Yellow" });
-        else setColorLabel(activeImg, nextLbl);
-      } else if (code === "Digit8" || code === "Numpad8" || e.key === "8") {
+        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
+      } else if (pressedDigit === 8) {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
         const nextLbl = activeImg.effective_label === "Green" ? "" : "Green";
         if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Green" });
-        else setColorLabel(activeImg, nextLbl);
-      } else if (code === "Digit9" || code === "Numpad9" || e.key === "9") {
+        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
+      } else if (pressedDigit === 9) {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
         const nextLbl = activeImg.effective_label === "Blue" ? "" : "Blue";
         if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Blue" });
-        else setColorLabel(activeImg, nextLbl);
+        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
       } else if (code === "KeyP" || k === "p") {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
         const nextLbl = activeImg.effective_label === "Purple" ? "" : "Purple";
         if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Purple" });
-        else setColorLabel(activeImg, nextLbl);
+        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
       } else if (code === "KeyX" || k === "x") {
         setUserFlag(activeImg, -1);
       } else if (code === "KeyU" || k === "u") {
         setUserFlag(activeImg, 0);
       }
-    });
+    }, true);
   }
 
   window.addEventListener("DOMContentLoaded", init);

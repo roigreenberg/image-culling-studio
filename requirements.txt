@@ -1,21 +1,18 @@
-ultralytics
 transformers
-accelerate
 sentencepiece
 protobuf
 rawpy
 pillow
 opencv-python-headless
 numpy
-scipy
 pandas
 tqdm
 exifread
 huggingface_hub
-onnxruntime-gpu
+onnxruntime-gpu; sys_platform != "darwin" and platform_machine != "aarch64" and platform_machine != "arm64"
+onnxruntime; sys_platform == "darwin" or platform_machine == "aarch64" or platform_machine == "arm64"
 lightgbm
 scikit-learn
 joblib
 fastapi
-uvicorn
-python-multipart
+uvicorn[standard]
