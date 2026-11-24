@@ -1,0 +1,1152 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ImageCulling Studio — Local GPU Wildlife &amp; Landscape AI Culling</title>
+  <meta name="description" content="Free, open-source, 100% local GPU wildlife, bird, and sunrise/landscape culling studio powered by Project Kestrel and SigLIP 2." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --bg-alt: #12161f;
+      --card: #161b26;
+      --card-hover: #1c2230;
+      --border: #262e40;
+      --text: #edf2fa;
+      --muted: #9aa5bb;
+      --gold: #f5b942;
+      --gold-soft: rgba(245, 185, 66, 0.14);
+      --green: #34d399;
+      --green-soft: rgba(52, 211, 153, 0.14);
+      --blue: #60a5fa;
+      --blue-soft: rgba(96, 165, 250, 0.14);
+      --radius: 14px;
+      --maxw: 1140px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(900px 500px at 15% -5%, rgba(245, 185, 66, 0.11), transparent 60%),
+        radial-gradient(800px 500px at 88% 5%, rgba(52, 211, 153, 0.08), transparent 60%),
+        var(--bg);
+      color: var(--text);
+      font-family: "Inter", "Heebo", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+    html[dir="rtl"] body {
+      font-family: "Heebo", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    a { color: inherit; text-decoration: none; }
+    .container { max-width: var(--maxw); margin: 0 auto; padding: 0 22px; }
+
+    /* Navbar */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(11, 13, 18, 0.88);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid rgba(38, 46, 64, 0.8);
+    }
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      height: 66px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      font-size: 1.06rem;
+      letter-spacing: -0.02em;
+    }
+    .brand-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      background: linear-gradient(135deg, #f5b942, #34d399);
+      display: grid;
+      place-items: center;
+      color: #0b0d12;
+      flex-shrink: 0;
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .nav-links a:hover { color: var(--text); }
+    .nav-actions { display: flex; align-items: center; gap: 10px; }
+
+    .lang-toggle {
+      display: inline-flex;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 3px;
+      gap: 2px;
+    }
+    .lang-btn {
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      font-family: inherit;
+      font-size: 0.8rem;
+      font-weight: 700;
+      padding: 5px 11px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .lang-btn.active {
+      background: var(--gold);
+      color: #161000;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 11px 20px;
+      border-radius: 10px;
+      font-family: inherit;
+      font-weight: 700;
+      font-size: 0.92rem;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+      transition: transform 0.12s ease, background 0.15s ease, border-color 0.15s ease;
+    }
+    .btn:hover { background: var(--card-hover); border-color: #3c4763; transform: translateY(-1px); }
+    .btn-primary {
+      background: linear-gradient(135deg, #f5b942, #e59d1c);
+      border-color: #f5b942;
+      color: #171000;
+      box-shadow: 0 8px 26px rgba(245, 185, 66, 0.22);
+    }
+    .btn-primary:hover { background: linear-gradient(135deg, #fbca5d, #f5b942); border-color: #fbca5d; }
+    .btn-green {
+      background: rgba(52, 211, 153, 0.16);
+      border-color: rgba(52, 211, 153, 0.5);
+      color: #6ee7b7;
+    }
+    .btn-green:hover { background: rgba(52, 211, 153, 0.26); }
+
+    /* Hero */
+    .hero {
+      padding: 72px 0 54px;
+      text-align: center;
+    }
+    .version-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 14px;
+      border-radius: 999px;
+      background: var(--gold-soft);
+      border: 1px solid rgba(245, 185, 66, 0.35);
+      color: #fcd34d;
+      font-size: 0.82rem;
+      font-weight: 600;
+      margin-bottom: 20px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; }
+    .hero h1 {
+      margin: 0 auto 18px;
+      max-width: 820px;
+      font-size: clamp(2rem, 4.6vw, 3.35rem);
+      font-weight: 800;
+      line-height: 1.15;
+      letter-spacing: -0.025em;
+    }
+    .hero h1 .accent {
+      background: linear-gradient(90deg, #f5b942, #34d399);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero p.lead {
+      margin: 0 auto 30px;
+      max-width: 720px;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+    .hero-ctas {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+      margin-bottom: 36px;
+    }
+    .stats-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      max-width: 900px;
+      margin: 0 auto;
+    }
+    .stat-box {
+      background: rgba(22, 27, 38, 0.82);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 12px;
+    }
+    .stat-box .k { font-size: 1.05rem; font-weight: 800; color: var(--text); }
+    .stat-box .v { font-size: 0.78rem; color: var(--muted); margin-top: 3px; }
+
+    /* Sections */
+    section { padding: 56px 0; }
+    section.alt { background: rgba(18, 22, 31, 0.65); border-top: 1px solid rgba(38,46,64,0.6); border-bottom: 1px solid rgba(38,46,64,0.6); }
+    .section-head {
+      text-align: center;
+      max-width: 700px;
+      margin: 0 auto 36px;
+    }
+    .section-head h2 {
+      margin: 0 0 10px;
+      font-size: clamp(1.55rem, 3vw, 2.15rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+    .section-head p { margin: 0; color: var(--muted); font-size: 0.98rem; }
+
+    /* Videos */
+    .video-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 20px;
+    }
+    .video-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .video-frame {
+      position: relative;
+      aspect-ratio: 16 / 9;
+      background: #07090d;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .video-frame video, .video-frame iframe {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border: 0;
+      display: block;
+    }
+    .video-fallback {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 24px;
+      background: radial-gradient(circle at center, rgba(245,185,66,0.12), rgba(11,13,18,0.95));
+      gap: 10px;
+    }
+    .video-fallback.show { display: flex; }
+    .play-badge {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      background: var(--gold-soft);
+      border: 1px solid rgba(245, 185, 66, 0.5);
+      color: var(--gold);
+      display: grid;
+      place-items: center;
+      font-size: 1.4rem;
+    }
+    .video-meta {
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .video-meta-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .video-meta h3 { margin: 0; font-size: 1.05rem; font-weight: 700; }
+    .badge {
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      color: #93c5fd;
+      border: 1px solid rgba(96, 165, 250, 0.35);
+      white-space: nowrap;
+    }
+    .video-meta p { margin: 0; font-size: 0.88rem; color: var(--muted); }
+    .video-lang-switch {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      margin-bottom: 22px;
+    }
+
+    /* Feature Grid */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+    }
+    .feature-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+      transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .feature-card:hover { border-color: #3d4864; transform: translateY(-2px); }
+    .feature-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      font-size: 1.25rem;
+      margin-bottom: 14px;
+      background: var(--gold-soft);
+      border: 1px solid rgba(245, 185, 66, 0.3);
+    }
+    .feature-card h3 { margin: 0 0 8px; font-size: 1.02rem; font-weight: 700; }
+    .feature-card p { margin: 0; font-size: 0.88rem; color: var(--muted); }
+
+    /* Download & Install */
+    .install-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 18px;
+    }
+    .install-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+    .install-card h3 { margin: 0 0 12px; font-size: 1.1rem; display: flex; align-items: center; gap: 10px; }
+    .install-card ol {
+      margin: 0 0 16px;
+      padding-inline-start: 20px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .install-card li { margin-bottom: 8px; }
+    code {
+      background: #0d1017;
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 5px;
+      font-size: 0.84em;
+      color: #fcd34d;
+      direction: ltr;
+      unicode-bidi: embed;
+    }
+    .release-notes-box {
+      margin-top: 22px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 22px;
+    }
+    .release-notes-box h4 { margin: 0 0 8px; font-size: 0.95rem; color: var(--gold); }
+    .release-notes-box pre {
+      margin: 0;
+      white-space: pre-wrap;
+      font-family: inherit;
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+
+    /* Contact & Social */
+    .contact-grid {
+      display: grid;
+      grid-template-columns: 1.35fr 1fr;
+      gap: 22px;
+      align-items: start;
+    }
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+    .panel h3 { margin: 0 0 8px; font-size: 1.12rem; }
+    .panel .sub { margin: 0 0 18px; font-size: 0.88rem; color: var(--muted); }
+    .field { margin-bottom: 14px; }
+    .field label {
+      display: block;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
+    .field input, .field select, .field textarea {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0e121a;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.9rem;
+    }
+    .field textarea { min-height: 112px; resize: vertical; }
+    .field input:focus, .field select:focus, .field textarea:focus {
+      outline: none;
+      border-color: var(--gold);
+    }
+    .form-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .form-status {
+      margin-top: 12px;
+      font-size: 0.85rem;
+      color: var(--green);
+      min-height: 20px;
+    }
+
+    .social-list { display: flex; flex-direction: column; gap: 12px; }
+    .social-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 16px;
+      border-radius: 11px;
+      background: #10141d;
+      border: 1px solid var(--border);
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .social-item:hover { border-color: var(--gold); background: #171d2b; }
+    .social-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      flex-shrink: 0;
+    }
+    .si-ig { background: linear-gradient(135deg, #f58529, #dd2a7b, #8134af); color: #fff; }
+    .si-fb { background: #1877f2; color: #fff; }
+    .si-gh { background: #24292f; color: #fff; border: 1px solid #3c4452; }
+    .social-text strong { display: block; font-size: 0.94rem; }
+    .social-text span { font-size: 0.82rem; color: var(--muted); direction: ltr; unicode-bidi: embed; display: inline-block; }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 28px 0 40px;
+      color: var(--muted);
+      font-size: 0.84rem;
+      text-align: center;
+    }
+    footer a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+    footer .links-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 16px; margin-bottom: 10px; }
+
+    @media (max-width: 900px) {
+      .stats-strip { grid-template-columns: repeat(2, 1fr); }
+      .features-grid { grid-template-columns: repeat(2, 1fr); }
+      .video-grid, .install-grid, .contact-grid { grid-template-columns: 1fr; }
+      .nav-links { display: none; }
+    }
+    @media (max-width: 560px) {
+      .features-grid { grid-template-columns: 1fr; }
+      .hero { padding: 48px 0 36px; }
+    }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="container nav-inner">
+    <a href="#" class="brand">
+      <span class="brand-icon" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/>
+          <path d="M14.31 8l5.74 9.94M9.69 8h11.48M7.38 12l5.74-9.94M9.69 16L3.95 6.06M14.31 16H2.83M16.62 12l-5.74 9.94"/>
+        </svg>
+      </span>
+      <span>ImageCulling Studio</span>
+    </a>
+    <div class="nav-links">
+      <a href="#videos" data-i18n="nav_videos">Videos</a>
+      <a href="#features" data-i18n="nav_features">Features</a>
+      <a href="#download" data-i18n="nav_download">Download</a>
+      <a href="#contact" data-i18n="nav_contact">Contact</a>
+      <a href="https://github.com/roigreenberg/image-culling-studio#readme" target="_blank" rel="noopener" data-i18n="nav_readme">README</a>
+    </div>
+    <div class="nav-actions">
+      <div class="lang-toggle" role="group" aria-label="Language switcher">
+        <button class="lang-btn active" id="btnLangEN" type="button">EN</button>
+        <button class="lang-btn" id="btnLangHE" type="button">עברית</button>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <div class="version-pill">
+      <span class="dot"></span>
+      <span id="heroVersionBadge">v1.0.0 · Free &amp; Open Source (AGPL-3.0)</span>
+    </div>
+    <h1 data-i18n-html="hero_title">
+      Local GPU AI Culling for <span class="accent">Wildlife, Birds &amp; Sunrises</span>
+    </h1>
+    <p class="lead" data-i18n="hero_lead">
+      Turn thousands of RAW burst shots into your sharpest keepers and portfolio-worthy edits — running 100% locally on Windows (NVIDIA CUDA) and macOS (Apple Silicon), with zero cloud fees and zero risk to your RAW files.
+    </p>
+    <div class="hero-ctas">
+      <a id="btnHeroDownload" class="btn btn-primary" href="https://github.com/roigreenberg/image-culling-studio/releases/latest" target="_blank" rel="noopener">
+        <span>⬇</span>
+        <span data-i18n="cta_download">Download Latest Release</span>
+      </a>
+      <a class="btn" href="https://github.com/roigreenberg/image-culling-studio#readme" target="_blank" rel="noopener">
+        <span>📖</span>
+        <span data-i18n="cta_readme">Read Full README</span>
+      </a>
+      <a class="btn btn-green" href="#videos">
+        <span>▶</span>
+        <span data-i18n="cta_videos">Watch Demo Videos</span>
+      </a>
+    </div>
+
+    <div class="stats-strip">
+      <div class="stat-box">
+        <div class="k" data-i18n="stat1_k">100% Local GPU</div>
+        <div class="v" data-i18n="stat1_v">No cloud upload or subscription</div>
+      </div>
+      <div class="stat-box">
+        <div class="k" data-i18n="stat2_k">Two-Track AI</div>
+        <div class="v" data-i18n="stat2_v">Wildlife + Sun / Landscape</div>
+      </div>
+      <div class="stat-box">
+        <div class="k" data-i18n="stat3_k">RAW Read-Only</div>
+        <div class="v" data-i18n="stat3_v">Safe XMP sync &amp; full Undo</div>
+      </div>
+      <div class="stat-box">
+        <div class="k" data-i18n="stat4_k">Learns Your Eye</div>
+        <div class="v" data-i18n="stat4_v">Personal LightGBM ranker</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section id="videos" class="alt">
+  <div class="container">
+    <div class="section-head">
+      <h2 data-i18n="vid_heading">See It in Action</h2>
+      <p data-i18n="vid_sub">Watch the 1-minute overview and the step-by-step walkthrough tutorial — available in both English and Hebrew.</p>
+    </div>
+
+    <div class="video-lang-switch">
+      <button type="button" class="btn" id="btnVidEN">🇺🇸 English Videos</button>
+      <button type="button" class="btn" id="btnVidHE">🇮🇱 סרטונים בעברית</button>
+    </div>
+
+    <div class="video-grid">
+      <article class="video-card">
+        <div class="video-frame" id="slotShortFrame">
+          <video id="videoShort" controls playsinline preload="metadata"></video>
+          <div class="video-fallback" id="fallbackShort">
+            <div class="play-badge">▶</div>
+            <strong data-i18n="vid_soon_title">Promo video coming soon</strong>
+            <span style="font-size:0.82rem;color:var(--muted)" id="fallbackShortPath"></span>
+            <a class="btn" href="https://github.com/roigreenberg/image-culling-studio/releases" target="_blank" rel="noopener" data-i18n="vid_check_releases">Check GitHub Releases</a>
+          </div>
+        </div>
+        <div class="video-meta">
+          <div class="video-meta-top">
+            <h3 data-i18n="vid1_title">ImageCulling Studio — 60-Second Feature Tour</h3>
+            <span class="badge" data-i18n="vid1_dur">~1 min · 1080p</span>
+          </div>
+          <p data-i18n="vid1_desc">A fast tour of how ImageCulling Studio turns thousands of RAW bursts into crisp keepers and ready-to-edit picks.</p>
+        </div>
+      </article>
+
+      <article class="video-card">
+        <div class="video-frame" id="slotDeepFrame">
+          <video id="videoDeep" controls playsinline preload="metadata"></video>
+          <div class="video-fallback" id="fallbackDeep">
+            <div class="play-badge">▶</div>
+            <strong data-i18n="vid_soon_title">Video coming soon</strong>
+            <span style="font-size:0.82rem;color:var(--muted)" id="fallbackDeepPath"></span>
+            <a class="btn" href="https://github.com/roigreenberg/image-culling-studio/releases" target="_blank" rel="noopener" data-i18n="vid_check_releases">View Releases on GitHub</a>
+          </div>
+        </div>
+        <div class="video-meta">
+          <div class="video-meta-top">
+            <h3 data-i18n="vid2_title">ImageCulling Studio — Full Workflow Guide</h3>
+            <span class="badge" data-i18n="vid2_dur">~2.5 min · 1080p</span>
+          </div>
+          <p data-i18n="vid2_desc">Full walkthrough: opening folders, reviewing Loupe &amp; AI boxes, splitting bursts, syncing XMP ratings, and training your personal ranker.</p>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="container">
+    <div class="section-head">
+      <h2 data-i18n="feat_heading">What We Built</h2>
+      <p data-i18n="feat_sub">Designed specifically around how real wildlife &amp; nature photographers shoot, cull, and edit in Lightroom Classic.</p>
+    </div>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🦅</div>
+        <h3 data-i18n="f1_t">Project Kestrel + SigLIP 2</h3>
+        <p data-i18n="f1_d">Combines MegaDetector, SAM-HQ silhouette segmentation, BioCLIP 2 species ID &amp; false-positive gating, Kestrel sharpness, and SigLIP 2 eye-contact &amp; action scoring across 100% of images.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🌅</div>
+        <h3 data-i18n="f2_t">Wildlife + Sunrise / Landscape</h3>
+        <p data-i18n="f2_d">Routes animals to Track A and scenic sun/sunrise/sunset shots to Track B—plus a +15% Hybrid Light bonus when wildlife is caught in dramatic golden-hour light.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🎬</div>
+        <h3 data-i18n="f3_t">Smart Scenario &amp; Flight Rules</h3>
+        <p data-i18n="f3_d">No arbitrary count quotas. Splits scenarios automatically on ≥10% zoom changes, keeps complete good flying-bird sequences, and picks 1 standout frame per distinct pose for Edit.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🖥️</div>
+        <h3 data-i18n="f4_t">ImageCulling Studio Web UI</h3>
+        <p data-i18n="f4_d">Fast local browser studio with side-by-side compare, 1:1 head crops, AI box &amp; Canon AF point overlay, manual Burst Split, and full English/Hebrew keyboard shortcuts.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🛡️</div>
+        <h3 data-i18n="f5_t">Safe XMP Sync &amp; Full Undo</h3>
+        <p data-i18n="f5_d">Never touches RAW pixels or Lightroom Develop edits. Atomic XMP rating/label sync with pre-edit snapshots, Ctrl+Z undo, and full Hebrew/Unicode Windows path safety.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🧠</div>
+        <h3 data-i18n="f6_t">Learns Your Personal Taste</h3>
+        <p data-i18n="f6_d">Every Keep, Edit, or Reject override you make can train a local LightGBM ranker over SigLIP 2 + BioCLIP 2 embeddings so future shoots rank closer to your own eye.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="download" class="alt">
+  <div class="container">
+    <div class="section-head">
+      <h2 data-i18n="dl_heading">Easy Download &amp; One-Click Setup</h2>
+      <p data-i18n="dl_sub">No Git and no Python pre-installed? No problem. Download the release ZIP and double-click the installer for your OS.</p>
+    </div>
+
+    <div style="text-align:center;margin-bottom:26px;display:flex;flex-wrap:wrap;justify-content:center;gap:12px;">
+      <a id="btnSectionDownload" class="btn btn-primary" href="https://github.com/roigreenberg/image-culling-studio/releases/latest" target="_blank" rel="noopener">
+        <span>⬇</span>
+        <span id="dlBtnText" data-i18n="cta_download">Download Latest Release</span>
+      </a>
+      <a class="btn" href="https://github.com/roigreenberg/image-culling-studio" target="_blank" rel="noopener">
+        <span>💻</span>
+        <span data-i18n="cta_repo">Browse GitHub Repository</span>
+      </a>
+      <a class="btn" href="https://github.com/roigreenberg/image-culling-studio#readme" target="_blank" rel="noopener">
+        <span>📖</span>
+        <span data-i18n="cta_readme">Read Full README</span>
+      </a>
+    </div>
+
+    <div class="install-grid">
+      <div class="install-card">
+        <h3>🪟 <span data-i18n="win_title">Windows (NVIDIA CUDA or CPU)</span></h3>
+        <ol>
+          <li data-i18n-html="win_s1">Download and unzip the latest <code>ImageCulling-v*.zip</code> release.</li>
+          <li data-i18n-html="win_s2">Double-click <code>Install_Windows.bat</code> — automatically installs isolated Python 3.10, detects NVIDIA CUDA, installs packages, and downloads AI weights.</li>
+          <li data-i18n-html="win_s3">Double-click <code>Start_Windows.bat</code> to launch the Web UI in your browser.</li>
+        </ol>
+      </div>
+
+      <div class="install-card">
+        <h3>🍎 <span data-i18n="mac_title">macOS (Apple Silicon MPS / Intel)</span></h3>
+        <ol>
+          <li data-i18n-html="mac_s1">Download and unzip the latest <code>ImageCulling-v*.zip</code> release.</li>
+          <li data-i18n-html="mac_s2">Double-click <code>Install_MacOS.command</code> — automatically installs isolated Python 3.10, Apple Silicon MPS PyTorch, ONNX Runtime, and AI weights.</li>
+          <li data-i18n-html="mac_s3">Double-click <code>Start_MacOS.command</code> to open ImageCulling Studio.</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="release-notes-box" id="releaseNotesBox">
+      <h4 id="releaseNotesHeading" data-i18n="rn_heading">Built-in Auto-Updater &amp; Latest Release Notes</h4>
+      <pre id="releaseNotesBody" data-i18n="rn_default">ImageCulling Studio checks for updates automatically when opened and includes a one-click "Check / Install Update" button in Settings — preserving all your databases, models, and photos.</pre>
+    </div>
+  </div>
+</section>
+
+<section id="contact">
+  <div class="container">
+    <div class="section-head">
+      <h2 data-i18n="contact_heading">Contact &amp; Send Feedback</h2>
+      <p data-i18n="contact_sub">Have a feature idea, bug report, or feedback from your wildlife shoots? Send a message or reach out directly.</p>
+    </div>
+
+    <div class="contact-grid">
+      <div class="panel">
+        <h3 data-i18n="form_title">Send Feedback</h3>
+        <p class="sub" data-i18n="form_sub">Your feedback opens directly as a pre-filled GitHub Issue (or sends directly if a form endpoint is configured), or you can copy it for a quick DM.</p>
+        <form id="feedbackForm">
+          <div class="field">
+            <label for="fbName" data-i18n="lbl_name">Your Name (optional)</label>
+            <input id="fbName" type="text" placeholder="Roi / Photographer" />
+          </div>
+          <div class="field">
+            <label for="fbType" data-i18n="lbl_type">Topic</label>
+            <select id="fbType">
+              <option value="Feature Idea" data-i18n="opt_feature">Feature Idea</option>
+              <option value="Bug Report" data-i18n="opt_bug">Bug Report</option>
+              <option value="General Feedback" data-i18n="opt_general">General Feedback</option>
+              <option value="Question" data-i18n="opt_question">Question</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="fbMsg" data-i18n="lbl_msg">Message</label>
+            <textarea id="fbMsg" required placeholder="Tell me what worked well or what we should improve..."></textarea>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn btn-primary" id="btnSubmitFeedback" data-i18n="btn_send_gh">Send Feedback via GitHub</button>
+            <button type="button" class="btn" id="btnCopyFeedback" data-i18n="btn_copy_msg">Copy Message for DM</button>
+          </div>
+          <div class="form-status" id="formStatus"></div>
+        </form>
+      </div>
+
+      <div class="panel">
+        <h3 data-i18n="social_title">Connect with Roi Greenberg</h3>
+        <p class="sub" data-i18n="social_sub">Follow wildlife photography, behind-the-scenes updates, and new releases.</p>
+        <div class="social-list">
+          <a class="social-item" href="https://www.instagram.com/roigreenberg" target="_blank" rel="noopener">
+            <span class="social-icon si-ig" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+                <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"/>
+                <line x1="17.5" y1="6.5" x2="17.51" y2="6.5"/>
+              </svg>
+            </span>
+            <div class="social-text">
+              <strong data-i18n="soc_ig">Instagram</strong>
+              <span>@roigreenberg</span>
+            </div>
+          </a>
+
+          <a class="social-item" href="https://www.facebook.com/roigreenberg" target="_blank" rel="noopener">
+            <span class="social-icon si-fb" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M15 3h3V0h-3c-3.3 0-5 2-5 5v3H7v3h3v10h4V11h3.5l.5-3H14V5.2c0-.9.3-1.2 1-1.2z"/>
+              </svg>
+            </span>
+            <div class="social-text">
+              <strong data-i18n="soc_fb">Facebook</strong>
+              <span>@roigreenberg</span>
+            </div>
+          </a>
+
+          <a class="social-item" href="https://github.com/roigreenberg/image-culling-studio" target="_blank" rel="noopener">
+            <span class="social-icon si-gh" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55v-1.94c-3.2.7-3.87-1.36-3.87-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.68 1.25 3.34.95.1-.74.4-1.25.72-1.53-2.55-.29-5.23-1.28-5.23-5.69 0-1.26.45-2.28 1.18-3.09-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.78 0c2.2-1.49 3.17-1.18 3.17-1.18.62 1.58.23 2.75.11 3.04.74.81 1.18 1.83 1.18 3.09 0 4.42-2.69 5.4-5.25 5.68.41.36.78 1.06.78 2.13v3.16c0 .31.21.66.79.55A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/>
+              </svg>
+            </span>
+            <div class="social-text">
+              <strong data-i18n="soc_gh">GitHub Repository &amp; Issues</strong>
+              <span>roigreenberg/image-culling-studio</span>
+            </div>
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="links-row">
+      <a href="https://github.com/roigreenberg/image-culling-studio" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/roigreenberg/image-culling-studio#readme" target="_blank" rel="noopener">README</a>
+      <a href="https://github.com/roigreenberg/image-culling-studio/blob/main/LICENSE" target="_blank" rel="noopener">GNU AGPL-3.0 License</a>
+      <a href="https://github.com/roigreenberg/image-culling-studio/blob/main/THIRD_PARTY_NOTICES.md" target="_blank" rel="noopener">Third-Party Notices</a>
+      <a href="https://github.com/roigreenberg/image-culling-studio/blob/main/SECURITY.md" target="_blank" rel="noopener">Security Policy</a>
+    </div>
+    <p data-i18n="footer_note">
+      Licensed under GNU AGPL-3.0. Incorporates offline analysis modules from SanjaySoniLV/ProjectKestrel (not affiliated with Project Kestrel LLC).
+    </p>
+  </div>
+</footer>
+
+<script>
+const CONFIG = {
+  githubRepo: "roigreenberg/image-culling-studio",
+  // Optional: set a Formspree endpoint (e.g. "https://formspree.io/f/yourid") for direct email submission without leaving the page.
+  // Leave empty to submit cleanly via pre-filled GitHub Issues (zero external account or secrets required).
+  feedbackEndpoint: "",
+  // Video URLs: upload the 4 rendered 1080p MP4s to a GitHub Release tagged "media-v1"
+  // OR replace any URL below with a YouTube link (watch?v=..., youtu.be/..., or /embed/...).
+  videos: {
+    en: {
+      short: "https://github.com/roigreenberg/image-culling-studio/releases/download/media-v1/ImageCulling_Short_EN.mp4",
+      deep: "https://github.com/roigreenberg/image-culling-studio/releases/download/media-v1/ImageCulling_DeepDive_EN.mp4",
+    },
+    he: {
+      short: "https://github.com/roigreenberg/image-culling-studio/releases/download/media-v1/ImageCulling_Short_HE.mp4",
+      deep: "https://github.com/roigreenberg/image-culling-studio/releases/download/media-v1/ImageCulling_DeepDive_HE.mp4",
+    },
+  },
+};
+
+const I18N = {
+  en: {
+    nav_videos: "Videos",
+    nav_features: "Features",
+    nav_download: "Download",
+    nav_contact: "Contact",
+    nav_readme: "README",
+    hero_title: 'Local GPU AI Culling for <span class="accent">Wildlife, Birds &amp; Sunrises</span>',
+    hero_lead: "Turn thousands of RAW burst shots into your sharpest keepers and portfolio-worthy edits — running 100% locally on Windows (NVIDIA CUDA) and macOS (Apple Silicon), with zero cloud fees and zero risk to your RAW files.",
+    cta_download: "Download Latest Release",
+    cta_readme: "Read Full README",
+    cta_videos: "Watch Demo Videos",
+    cta_repo: "Browse GitHub Repository",
+    stat1_k: "100% Local GPU",
+    stat1_v: "No cloud upload or subscription",
+    stat2_k: "Two-Track AI",
+    stat2_v: "Wildlife + Sun / Landscape",
+    stat3_k: "RAW Read-Only",
+    stat3_v: "Safe XMP sync & full Undo",
+    stat4_k: "Learns Your Eye",
+    stat4_v: "Personal LightGBM ranker",
+    vid_heading: "See It in Action",
+    vid_sub: "Watch the 1-minute overview and the step-by-step walkthrough tutorial — available in both English and Hebrew.",
+    vid1_title: "ImageCulling Studio — 60-Second Feature Tour",
+    vid1_dur: "~1 min · 1080p",
+    vid1_desc: "A fast tour of how ImageCulling Studio turns thousands of RAW bursts into crisp keepers and ready-to-edit picks.",
+    vid2_title: "ImageCulling Studio — Full Workflow Guide",
+    vid2_dur: "~2.5 min · 1080p",
+    vid2_desc: "Full walkthrough: opening folders, reviewing Loupe & AI boxes, splitting bursts, syncing XMP ratings, and training your personal ranker.",
+    vid_soon_title: "Video will appear here once published to GitHub Releases (media-v1) or YouTube",
+    vid_check_releases: "View Releases on GitHub",
+    feat_heading: "What We Built",
+    feat_sub: "Designed specifically around how real wildlife & nature photographers shoot, cull, and edit in Lightroom Classic.",
+    f1_t: "Project Kestrel + SigLIP 2",
+    f1_d: "Combines MegaDetector, SAM-HQ silhouette segmentation, BioCLIP 2 species ID & false-positive gating, Kestrel sharpness, and SigLIP 2 eye-contact & action scoring across 100% of images.",
+    f2_t: "Wildlife + Sunrise / Landscape",
+    f2_d: "Routes animals to Track A and scenic sun/sunrise/sunset shots to Track B—plus a +15% Hybrid Light bonus when wildlife is caught in dramatic golden-hour light.",
+    f3_t: "Smart Scenario & Flight Rules",
+    f3_d: "No arbitrary count quotas. Splits scenarios automatically on ≥10% zoom changes, keeps complete good flying-bird sequences, and picks 1 standout frame per distinct pose for Edit.",
+    f4_t: "ImageCulling Studio Web UI",
+    f4_d: "Fast local browser studio with side-by-side compare, 1:1 head crops, AI box & Canon AF point overlay, manual Burst Split, and full English/Hebrew keyboard shortcuts.",
+    f5_t: "Safe XMP Sync & Full Undo",
+    f5_d: "Never touches RAW pixels or Lightroom Develop edits. Atomic XMP rating/label sync with pre-edit snapshots, Ctrl+Z undo, and full Hebrew/Unicode Windows path safety.",
+    f6_t: "Learns Your Personal Taste",
+    f6_d: "Every Keep, Edit, or Reject override you make can train a local LightGBM ranker over SigLIP 2 + BioCLIP 2 embeddings so future shoots rank closer to your own eye.",
+    dl_heading: "Easy Download & One-Click Setup",
+    dl_sub: "No Git and no Python pre-installed? No problem. Download the release ZIP and double-click the installer for your OS.",
+    win_title: "Windows (NVIDIA CUDA or CPU)",
+    win_s1: "Download and unzip the latest <code>ImageCulling-v*.zip</code> release.",
+    win_s2: "Double-click <code>Install_Windows.bat</code> — automatically installs isolated Python 3.10, detects NVIDIA CUDA, installs packages, and downloads AI weights.",
+    win_s3: "Double-click <code>Start_Windows.bat</code> to launch the Web UI in your browser.",
+    mac_title: "macOS (Apple Silicon MPS / Intel)",
+    mac_s1: "Download and unzip the latest <code>ImageCulling-v*.zip</code> release.",
+    mac_s2: "Double-click <code>Install_MacOS.command</code> — automatically installs isolated Python 3.10, Apple Silicon MPS PyTorch, ONNX Runtime, and AI weights.",
+    mac_s3: "Double-click <code>Start_MacOS.command</code> to open ImageCulling Studio.",
+    rn_heading: "Built-in Auto-Updater & Latest Release Notes",
+    rn_default: "ImageCulling Studio checks for updates automatically when opened and includes a one-click Check / Install Update button in Settings — preserving all your databases, models, and photos.",
+    contact_heading: "Contact & Send Feedback",
+    contact_sub: "Have a feature idea, bug report, or feedback from your wildlife shoots? Send a message or reach out directly.",
+    form_title: "Send Feedback",
+    form_sub: "Your feedback opens as a pre-filled GitHub Issue (or sends directly when a form endpoint is configured), or you can copy it for a quick DM.",
+    lbl_name: "Your Name (optional)",
+    lbl_type: "Topic",
+    opt_feature: "Feature Idea",
+    opt_bug: "Bug Report",
+    opt_general: "General Feedback",
+    opt_question: "Question",
+    lbl_msg: "Message",
+    btn_send_gh: "Send Feedback via GitHub",
+    btn_send_direct: "Send Feedback",
+    btn_copy_msg: "Copy Message for DM",
+    social_title: "Connect with Roi Greenberg",
+    social_sub: "Follow wildlife photography, behind-the-scenes updates, and new releases.",
+    soc_ig: "Instagram",
+    soc_fb: "Facebook",
+    soc_gh: "GitHub Repository & Issues",
+    footer_note: "Licensed under GNU AGPL-3.0. Incorporates offline analysis modules from SanjaySoniLV/ProjectKestrel (not affiliated with Project Kestrel LLC).",
+    copied_ok: "Message copied! Paste it into an Instagram or Facebook DM.",
+    gh_opened: "Opened pre-filled GitHub feedback form in a new tab!",
+    sent_ok: "Thank you! Your feedback has been sent.",
+  },
+  he: {
+    nav_videos: "סרטונים",
+    nav_features: "יכולות",
+    nav_download: "הורדה",
+    nav_contact: "צור קשר",
+    nav_readme: "מדריך README",
+    hero_title: 'סינון תמונות AI מקומי על ה-GPU <span class="accent">לטבע, ציפורים וזריחות</span>',
+    hero_lead: "הפכו אלפי תמונות RAW מרצפי צילום לתמונות החדות והטובות ביותר לעריכה — 100% מקומי על Windows (NVIDIA CUDA) ו-macOS (Apple Silicon), ללא ענן, ללא עלויות וללא כל שינוי לקבצי ה-RAW.",
+    cta_download: "הורדת הגרסה האחרונה",
+    cta_readme: "קריאת המדריך המלא (README)",
+    cta_videos: "צפייה בסרטוני ההדגמה",
+    cta_repo: "למאגר הקוד ב-GitHub",
+    stat1_k: "100% GPU מקומי",
+    stat1_v: "ללא העלאה לענן וללא מנוי",
+    stat2_k: "AI דו-מסלולי",
+    stat2_v: "חיות בר + זריחות ונופים",
+    stat3_k: "קריאה בלבד ל-RAW",
+    stat3_v: "סנכרון XMP בטוח וביטול מלא",
+    stat4_k: "לומד את הטעם שלך",
+    stat4_v: "מדרג LightGBM אישי",
+    vid_heading: "איך זה עובד בפועל",
+    vid_sub: "צפו בסקירה הקצרה (דקה אחת) ובמדריך השימוש המלא צעד-אחר-צעד — בעברית ובאנגלית.",
+    vid1_title: "ImageCulling Studio — הכירו את המערכת בדקה",
+    vid1_dur: "~דקה · 1080p",
+    vid1_desc: "הצצה מהירה לאופן שבו ImageCulling Studio הופך אלפי תמונות RAW מרצפי צילום לבחירות החדות והמוצלחות ביותר לעריכה.",
+    vid2_title: "ImageCulling Studio — מדריך שימוש מלא",
+    vid2_dur: "~2.5 דקות · 1080p",
+    vid2_desc: "הדרכה מלאה: פתיחת תיקיות, זכוכית מגדלת ותיבות AI, פיצול רצפים, סנכרון דירוגים ל-Lightroom ואימון המדרג האישי.",
+    vid_soon_title: "הסרטון יופיע כאן מיד לאחר ההעלאה ל-GitHub Releases (media-v1) או ל-YouTube",
+    vid_check_releases: "לצפייה בשחרורים ב-GitHub",
+    feat_heading: "מה בנינו",
+    feat_sub: "נבנה במיוחד לפי צורת העבודה האמיתית של צלמי טבע וציפורים עם Lightroom Classic.",
+    f1_t: "Project Kestrel + SigLIP 2",
+    f1_d: "שילוב MegaDetector, חיתוך צללית SAM-HQ, זיהוי מינים וסינון טעויות BioCLIP 2, מדד חדות של Kestrel ו-SigLIP 2 לקשר עין, ברק בעין ואקשן על 100% מהתמונות.",
+    f2_t: "חיות בר + זריחות / נופים",
+    f2_d: "מנתב בעלי חיים למסלול חיות בר ותמונות שמש/זריחה/נוף למסלול נופים — עם בונוס +15% לצילומי טבע באור שעת זהב דרמטי.",
+    f3_t: "חוקי סצנה ורצפי תעופה חכמים",
+    f3_d: "ללא מכסות שרירותיות. מפריד סצנות אוטומטית בשינוי זום של ≥10%, שומר רצפי תעופה טובים במלואם, ומקדם לעריכה תמונה מובילה לכל פוזה.",
+    f4_t: "ממשק Web Studio מקומי",
+    f4_d: "ממשק דפדפן מהיר עם השוואה צד-לצד, קרופ 1:1 לראש, שכבת זיהוי AI ונקודות פוקוס של Canon, פיצול רצפים ידני וקיצורי מקלדת בעברית ובאנגלית.",
+    f5_t: "סנכרון XMP בטוח וביטול מלא",
+    f5_d: "לא נוגע בקבצי ה-RAW או בעריכות ה-Develop ב-Lightroom. כתיבת XMP אטומית עם גיבוי לפני שינוי, Ctrl+Z ותמיכה מלאה בנתיבים בעברית ב-Windows.",
+    f6_t: "לומד את הסגנון האישי שלך",
+    f6_d: "כל שינוי של Keep / Edit / Reject יכול לאמן מדרג LightGBM מקומי על גבי ה-Embeddings של SigLIP 2 ו-BioCLIP 2 לדירוג מדויק יותר בימי הצילום הבאים.",
+    dl_heading: "הורדה והתקנה בקליק אחד",
+    dl_sub: "אין לכם Git או Python מותקן? אין צורך. מורידים את קובץ ה-ZIP ולוחצים פעמיים על קובץ ההתקנה.",
+    win_title: "Windows (כרטיס NVIDIA CUDA או מעבד)",
+    win_s1: "מורידים ומחלצים את קובץ השחרור האחרון <code>ImageCulling-v*.zip</code>.",
+    win_s2: "לוחצים פעמיים על <code>Install_Windows.bat</code> — מתקין אוטומטית Python 3.10 מבודד, מזהה כרטיס NVIDIA CUDA, מתקין חבילות ומוריד את מודלי ה-AI.",
+    win_s3: "לוחצים פעמיים על <code>Start_Windows.bat</code> להפעלת הסטודיו בדפדפן.",
+    mac_title: "macOS (Apple Silicon MPS / Intel)",
+    mac_s1: "מורידים ומחלצים את קובץ השחרור האחרון <code>ImageCulling-v*.zip</code>.",
+    mac_s2: "לוחצים פעמיים על <code>Install_MacOS.command</code> — מתקין אוטומטית Python 3.10 מבודד, PyTorch עם MPS, ONNX Runtime ומודלי AI.",
+    mac_s3: "לוחצים פעמיים על <code>Start_MacOS.command</code> לפתיחת ImageCulling Studio.",
+    rn_heading: "עדכון אוטומטי מובנה ומה חדש בגרסה האחרונה",
+    rn_default: "ImageCulling Studio בודק עדכונים אוטומטית בעלייה וכולל כפתור בדיקה והתקנת עדכון בהגדרות — מבלי לפגוע במסד הנתונים, במודלים או בתמונות שלכם.",
+    contact_heading: "יצירת קשר ושליחת פידבק",
+    contact_sub: "יש לכם רעיון לפיצ׳ר, דיווח על באג או פידבק מיום הצילום? אשמח לשמוע מכם.",
+    form_title: "שליחת פידבק",
+    form_sub: "הפידבק נפתח ישירות כ-GitHub Issue מוכן מראש (או נשלח ישירות אם הוגדרה כתובת טופס), וניתן גם להעתיק אותו להודעה ישירה.",
+    lbl_name: "השם שלך (אופציונלי)",
+    lbl_type: "נושא",
+    opt_feature: "רעיון לפיצ׳ר",
+    opt_bug: "דיווח על באג",
+    opt_general: "פידבק כללי",
+    opt_question: "שאלה",
+    lbl_msg: "הודעה",
+    btn_send_gh: "שליחת פידבק דרך GitHub",
+    btn_send_direct: "שליחת פידבק",
+    btn_copy_msg: "העתקת הודעה ל-DM",
+    social_title: "עקבו וצרו קשר — רועי גרינברג",
+    social_sub: "צילומי טבע וציפורים, עדכונים מאחורי הקלעים וגרסאות חדשות.",
+    soc_ig: "אינסטגרם (Instagram)",
+    soc_fb: "פייסבוק (Facebook)",
+    soc_gh: "מאגר הקוד ב-GitHub",
+    footer_note: "מופץ ברישיון GNU AGPL-3.0. משלב מודולי ניתוח אופליין מ-SanjaySoniLV/ProjectKestrel (ללא שיוך ל-Project Kestrel LLC).",
+    copied_ok: "ההודעה הועתקה! אפשר להדביק בהודעה באינסטגרם או בפייסבוק.",
+    gh_opened: "נפתח טופס פידבק מוכן ב-GitHub בלשונית חדשה!",
+    sent_ok: "תודה! הפידבק נשלח בהצלחה.",
+  },
+};
+
+let currentLang = localStorage.getItem("ics_site_lang") || ((navigator.language || "").startsWith("he") ? "he" : "en");
+let videoLang = currentLang;
+
+function applyLanguage(lang) {
+  currentLang = lang === "he" ? "he" : "en";
+  localStorage.setItem("ics_site_lang", currentLang);
+  document.documentElement.lang = currentLang;
+  document.documentElement.dir = currentLang === "he" ? "rtl" : "ltr";
+
+  document.getElementById("btnLangEN").classList.toggle("active", currentLang === "en");
+  document.getElementById("btnLangHE").classList.toggle("active", currentLang === "he");
+
+  const dict = I18N[currentLang];
+  document.querySelectorAll("[data-i18n]").forEach(el => {
+    const k = el.getAttribute("data-i18n");
+    if (dict[k]) el.textContent = dict[k];
+  });
+  document.querySelectorAll("[data-i18n-html]").forEach(el => {
+    const k = el.getAttribute("data-i18n-html");
+    if (dict[k]) el.innerHTML = dict[k];
+  });
+
+  if (CONFIG.feedbackEndpoint) {
+    document.getElementById("btnSubmitFeedback").textContent = dict.btn_send_direct;
+  }
+  setVideoLanguage(currentLang);
+}
+
+function toYouTubeEmbedUrl(url) {
+  if (!url) return null;
+  const mEmbed = url.match(/youtube\.com\/embed\/([A-Za-z0-9_-]{6,})/);
+  if (mEmbed) return `https://www.youtube.com/embed/${mEmbed[1]}?rel=0`;
+  const mWatch = url.match(/[?&]v=([A-Za-z0-9_-]{6,})/);
+  if (mWatch && /youtube\.com/i.test(url)) return `https://www.youtube.com/embed/${mWatch[1]}?rel=0`;
+  const mShort = url.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/);
+  if (mShort) return `https://www.youtube.com/embed/${mShort[1]}?rel=0`;
+  return null;
+}
+
+function loadVideoSlot(frameEl, videoEl, fallbackEl, pathEl, src) {
+  const existingIframe = frameEl.querySelector("iframe.yt-embed");
+  if (existingIframe) existingIframe.remove();
+
+  fallbackEl.classList.remove("show");
+  const ytUrl = toYouTubeEmbedUrl(src);
+  if (ytUrl) {
+    videoEl.pause();
+    videoEl.removeAttribute("src");
+    videoEl.style.display = "none";
+    const iframe = document.createElement("iframe");
+    iframe.className = "yt-embed";
+    iframe.src = ytUrl;
+    iframe.title = "ImageCulling Studio Video";
+    iframe.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share";
+    iframe.allowFullscreen = true;
+    frameEl.insertBefore(iframe, fallbackEl);
+    return;
+  }
+
+  videoEl.style.display = "block";
+  const shortName = (src || "").split("/").pop() || src;
+  pathEl.textContent = shortName;
+  videoEl.onerror = () => fallbackEl.classList.add("show");
+  videoEl.onloadedmetadata = () => fallbackEl.classList.remove("show");
+  videoEl.src = src;
+  videoEl.load();
+}
+
+function setVideoLanguage(lang) {
+  videoLang = lang === "he" ? "he" : "en";
+  document.getElementById("btnVidEN").classList.toggle("btn-primary", videoLang === "en");
+  document.getElementById("btnVidHE").classList.toggle("btn-primary", videoLang === "he");
+  const urls = CONFIG.videos[videoLang];
+  loadVideoSlot(
+    document.getElementById("slotShortFrame"),
+    document.getElementById("videoShort"),
+    document.getElementById("fallbackShort"),
+    document.getElementById("fallbackShortPath"),
+    urls.short
+  );
+  loadVideoSlot(
+    document.getElementById("slotDeepFrame"),
+    document.getElementById("videoDeep"),
+    document.getElementById("fallbackDeep"),
+    document.getElementById("fallbackDeepPath"),
+    urls.deep
+  );
+}
+
+async function fetchLatestRelease() {
+  try {
+    const resp = await fetch(`https://api.github.com/repos/${CONFIG.githubRepo}/releases/latest`, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!resp.ok) return;
+    const rel = await resp.json();
+    const tag = rel.tag_name || "v1.0.0";
+    const assets = rel.assets || [];
+    const zipAsset = assets.find(a => (a.name || "").toLowerCase().endsWith(".zip") && !(a.name || "").toLowerCase().includes("model"));
+    const dlUrl = (zipAsset && zipAsset.browser_download_url) || rel.html_url;
+
+    if (dlUrl) {
+      document.getElementById("btnHeroDownload").href = dlUrl;
+      document.getElementById("btnSectionDownload").href = dlUrl;
+    }
+    document.getElementById("heroVersionBadge").textContent = `${tag} · Free & Open Source (AGPL-3.0)`;
+    if (rel.body && rel.body.trim()) {
+      document.getElementById("releaseNotesHeading").textContent = `${rel.name || tag} — Release Notes`;
+      document.getElementById("releaseNotesBody").textContent = rel.body.trim();
+    }
+  } catch {
+    // Keep clean default links when offline or before first release is published
+  }
+}
+
+document.getElementById("btnLangEN").addEventListener("click", () => applyLanguage("en"));
+document.getElementById("btnLangHE").addEventListener("click", () => applyLanguage("he"));
+document.getElementById("btnVidEN").addEventListener("click", () => setVideoLanguage("en"));
+document.getElementById("btnVidHE").addEventListener("click", () => setVideoLanguage("he"));
+
+document.getElementById("btnCopyFeedback").addEventListener("click", async () => {
+  const name = document.getElementById("fbName").value.trim();
+  const topic = document.getElementById("fbType").value;
+  const msg = document.getElementById("fbMsg").value.trim();
+  const text = `[ImageCulling Studio - ${topic}]${name ? " From " + name : ""}:\n${msg}`;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); document.body.removeChild(ta);
+  }
+  document.getElementById("formStatus").textContent = I18N[currentLang].copied_ok;
+});
+
+document.getElementById("feedbackForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = document.getElementById("fbName").value.trim();
+  const topic = document.getElementById("fbType").value;
+  const msg = document.getElementById("fbMsg").value.trim();
+  const statusEl = document.getElementById("formStatus");
+  if (!msg) return;
+
+  if (CONFIG.feedbackEndpoint) {
+    try {
+      const r = await fetch(CONFIG.feedbackEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ name, topic, message: msg }),
+      });
+      if (r.ok) {
+        statusEl.textContent = I18N[currentLang].sent_ok;
+        document.getElementById("feedbackForm").reset();
+        return;
+      }
+    } catch {}
+  }
+
+  const title = encodeURIComponent(`[${topic}] Feedback${name ? " from " + name : ""}`);
+  const body = encodeURIComponent(`**Topic:** ${topic}\n${name ? `**From:** ${name}\n` : ""}\n${msg}`);
+  window.open(`https://github.com/${CONFIG.githubRepo}/issues/new?title=${title}&body=${body}`, "_blank", "noopener");
+  statusEl.textContent = I18N[currentLang].gh_opened;
+});
+
+applyLanguage(currentLang);
+fetchLatestRelease();
+</script>
+</body>
+</html>
