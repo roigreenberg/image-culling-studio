@@ -29,9 +29,44 @@ SECRET_PATTERNS = [
 ]
 USER_PATH_PATTERN = re.compile(r"(C:\\Users\\|/Users/|/home/)", re.IGNORECASE)
 PATH_DOC_ALLOWLIST = {"SECURITY.md", "scripts/pre-commit", "scripts/build_release.py"}
-EXEC_FILES = {"Install_MacOS.command", "Start_MacOS.command", "scripts/pre-commit"}
-EXCLUDED_RELEASE_FILES = {"package.json", "package-lock.json", "playwright.config.js"}
-EXCLUDED_RELEASE_PREFIXES = ("tests/", "docs/")
+EXEC_FILES = {"Install_MacOS.command", "Start_MacOS.command"}
+
+# Strict allowlist: ONLY files an end user needs to install, run, update, and comply with AGPL-3.0.
+# Excludes tests, docs/ (GitHub Pages), promo_video/, scripts/, git/node configs, and security/dev files.
+ALLOWED_EXACT_FILES = {
+    "CHANGELOG.md",
+    "Install_MacOS.command",
+    "Install_Windows.bat",
+    "LICENSE",
+    "README.md",
+    "Start_MacOS.command",
+    "Start_Windows.bat",
+    "THIRD_PARTY_NOTICES.md",
+    "VERSION",
+    "requirements-base.txt",
+    "requirements.txt",
+    "run_cull.py",
+    "run_webapp.py",
+    "setup_models.py",
+    "train_ranker.py",
+    "update.py",
+    "vendor/ProjectKestrel/LICENSE",
+    "vendor/ProjectKestrel/VERSION.txt",
+}
+ALLOWED_DIR_PREFIXES = (
+    "src/",
+    "webapp/",
+    "vendor/ProjectKestrel/analyzer/kestrel_analyzer/",
+    "vendor/ProjectKestrel/analyzer/models/",
+)
+
+
+def _is_release_file(norm: str) -> bool:
+    if any(part.startswith(".") for part in norm.split("/")):
+        return False
+    if norm in ALLOWED_EXACT_FILES:
+        return True
+    return any(norm.startswith(prefix) for prefix in ALLOWED_DIR_PREFIXES)
 
 
 def _tracked_files() -> list[str]:
@@ -54,7 +89,7 @@ def build_release_zip(out_dir: Path) -> Path:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for rel in files:
             norm = rel.replace("\\", "/")
-            if norm in EXCLUDED_RELEASE_FILES or any(norm.startswith(p) for p in EXCLUDED_RELEASE_PREFIXES):
+            if not _is_release_file(norm):
                 continue
             full = WORKSPACE_ROOT / norm
             if not full.is_file():
