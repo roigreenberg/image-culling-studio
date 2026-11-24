@@ -24,7 +24,6 @@ from tqdm import tqdm
 from src.config import PipelineConfig, load_local_env
 from src.deliverables import (
     export_preview_folders,
-    generate_html_report,
     write_structured_data_and_embeddings,
 )
 from src.io_utils import discover_images, load_preview_bgr_and_meta, save_jpeg_bgr
@@ -333,7 +332,7 @@ def run_pipeline(cfg: PipelineConfig, reselect_only: bool = False) -> Dict[str, 
     # Step 2D: Quality- & Scenario-Driven Selection (no hardcoded counts)
     records = select_layers_final(records, cfg, siglip_embs=siglip_embs)
 
-    # Step 3: Export 2048px JPEGs, CSV/JSON/embeddings.npz, and interactive report.html
+    # Step 3: Export 2048px JPEGs and CSV/JSON/embeddings.npz
     export_preview_folders(records, cfg)
     write_structured_data_and_embeddings(records, bio_embs, siglip_embs, cfg)
 
@@ -360,9 +359,8 @@ def run_pipeline(cfg: PipelineConfig, reselect_only: bool = False) -> Dict[str, 
         "rejected_count": rej_count,
         "runtime_seconds": round(elapsed, 2),
         "runtime_str": _format_duration(elapsed),
-        "report_path": str((cfg.output_dir / "report.html").resolve()),
+        "output_dir": str(cfg.output_dir.resolve()),
     }
-    generate_html_report(records, cfg, summary)
 
     logger.info("=" * 74)
     logger.info("PIPELINE COMPLETE SUMMARY")
@@ -373,7 +371,7 @@ def run_pipeline(cfg: PipelineConfig, reselect_only: bool = False) -> Dict[str, 
     logger.info("  Layer 1 (Keep total)    : %d (%.2f%%)", l1_total, summary["layer1_pct"])
     logger.info("  Layer 2 (To Edit)       : %d (%.2f%%)", l2_count, summary["layer2_pct"])
     logger.info("  Total runtime           : %s", summary["runtime_str"])
-    logger.info("  Interactive report      : %s", summary["report_path"])
+    logger.info("  Output directory        : %s", summary["output_dir"])
     logger.info("=" * 74)
     return summary
 
@@ -395,7 +393,7 @@ def main() -> None:
         dest="output",
         type=str,
         default=os.environ.get("CULL_OUTPUT_DIR", "./cull_output"),
-        help="Output directory for previews, CSV/JSON, embeddings, and report.html",
+        help="Output directory for previews, CSV/JSON, and embeddings.npz",
     )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--detector", type=str, default="mdv1000-cedar", choices=["mdv1000-cedar", "mdv5a"])
