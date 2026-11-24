@@ -61,6 +61,7 @@
       justify-content: space-between;
       gap: 16px;
       height: 66px;
+      direction: ltr;
     }
     .brand {
       display: flex;
@@ -69,6 +70,8 @@
       font-weight: 800;
       font-size: 1.06rem;
       letter-spacing: -0.02em;
+      order: 3;
+      direction: ltr;
     }
     .brand-icon {
       width: 34px;
@@ -86,12 +89,21 @@
       gap: 20px;
       font-size: 0.9rem;
       color: var(--muted);
+      order: 2;
     }
+    html[dir="rtl"] .nav-links { direction: rtl; }
     .nav-links a:hover { color: var(--text); }
-    .nav-actions { display: flex; align-items: center; gap: 10px; }
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      order: 1;
+      direction: ltr;
+    }
 
     .lang-toggle {
       display: inline-flex;
+      direction: ltr;
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 999px;
