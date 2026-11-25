@@ -408,14 +408,112 @@
       border-radius: var(--radius);
       padding: 20px 22px;
     }
-    .release-notes-box h4 { margin: 0 0 8px; font-size: 0.95rem; color: var(--gold); }
-    .release-notes-box pre {
-      margin: 0;
-      white-space: pre-wrap;
-      font-family: inherit;
+    .rn-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .rn-header h4 { margin: 0; font-size: 1rem; color: var(--gold); }
+    .rn-intro {
+      margin: 0 0 14px;
       font-size: 0.86rem;
       color: var(--muted);
     }
+    .rn-toggle-all {
+      font-size: 0.78rem;
+      padding: 6px 12px;
+      border-radius: 8px;
+    }
+    .rn-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .rn-entry {
+      background: #0e121a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .rn-entry[open] {
+      border-color: rgba(245, 185, 66, 0.35);
+    }
+    .rn-entry summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-weight: 700;
+      font-size: 0.92rem;
+      color: var(--text);
+      user-select: none;
+    }
+    .rn-entry summary::-webkit-details-marker { display: none; }
+    .rn-entry summary:hover { background: rgba(255, 255, 255, 0.03); }
+    .rn-sum-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .rn-chevron {
+      color: var(--muted);
+      font-size: 0.78rem;
+      transition: transform 0.16s ease;
+    }
+    .rn-entry[open] .rn-chevron { transform: rotate(90deg); color: var(--gold); }
+    .rn-ver-badge {
+      background: var(--gold-soft);
+      color: var(--gold);
+      border: 1px solid rgba(245, 185, 66, 0.4);
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 800;
+      direction: ltr;
+    }
+    .rn-latest-pill {
+      background: var(--green-soft);
+      color: var(--green);
+      border: 1px solid rgba(52, 211, 153, 0.4);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 700;
+    }
+    .rn-date { font-size: 0.8rem; color: var(--muted); font-weight: 500; direction: ltr; }
+    .rn-body {
+      padding: 4px 18px 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      font-size: 0.87rem;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .rn-body h5 {
+      margin: 12px 0 6px;
+      font-size: 0.86rem;
+      color: var(--green);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .rn-body h6 {
+      margin: 10px 0 4px;
+      font-size: 0.85rem;
+      color: var(--text);
+    }
+    .rn-body p { margin: 6px 0; }
+    .rn-body ul {
+      margin: 4px 0 8px;
+      padding-inline-start: 20px;
+    }
+    .rn-body li { margin-bottom: 5px; }
+    .rn-body li strong { color: var(--text); }
 
     /* Contact & Social */
     .contact-grid {
@@ -727,8 +825,12 @@
     </div>
 
     <div class="release-notes-box" id="releaseNotesBox">
-      <h4 id="releaseNotesHeading" data-i18n="rn_heading">Built-in Auto-Updater &amp; Latest Release Notes</h4>
-      <pre id="releaseNotesBody" data-i18n="rn_default">ImageCulling Studio checks for updates automatically when opened and includes a one-click "Check / Install Update" button in Settings — preserving all your databases, models, and photos.</pre>
+      <div class="rn-header">
+        <h4 data-i18n="rn_heading">Built-in Auto-Updater &amp; Changelog</h4>
+        <button type="button" class="btn rn-toggle-all" id="btnToggleAllReleases" data-i18n="rn_expand_all">Expand Full History</button>
+      </div>
+      <p class="rn-intro" data-i18n="rn_default">ImageCulling Studio checks for updates automatically when opened and includes a one-click Check / Install Update button in Settings — preserving all your databases, models, and photos.</p>
+      <div class="rn-list" id="releaseNotesList"></div>
     </div>
   </div>
 </section>
@@ -907,8 +1009,11 @@ const I18N = {
     mac_s1: "Download and unzip the latest <code>ImageCulling-v*.zip</code> release.",
     mac_s2: "Double-click <code>Install_MacOS.command</code> — automatically installs isolated Python 3.10, Apple Silicon MPS PyTorch, ONNX Runtime, and AI weights.",
     mac_s3: "Double-click <code>Start_MacOS.command</code> to open ImageCulling Studio.",
-    rn_heading: "Built-in Auto-Updater & Latest Release Notes",
+    rn_heading: "Built-in Auto-Updater & Changelog",
     rn_default: "ImageCulling Studio checks for updates automatically when opened and includes a one-click Check / Install Update button in Settings — preserving all your databases, models, and photos.",
+    rn_latest_pill: "Latest",
+    rn_expand_all: "Expand Full History",
+    rn_collapse_all: "Show Latest Only",
     contact_heading: "Contact & Send Feedback",
     contact_sub: "Have a feature idea, bug report, or feedback from your wildlife shoots? Send a message or reach out directly.",
     form_title: "Send Feedback",
@@ -987,8 +1092,11 @@ const I18N = {
     mac_s1: "מורידים ומחלצים את קובץ השחרור האחרון <code>ImageCulling-v*.zip</code>.",
     mac_s2: "לוחצים פעמיים על <code>Install_MacOS.command</code> — מתקין אוטומטית Python 3.10 מבודד, PyTorch עם MPS, ONNX Runtime ומודלי AI.",
     mac_s3: "לוחצים פעמיים על <code>Start_MacOS.command</code> לפתיחת ImageCulling Studio.",
-    rn_heading: "עדכון אוטומטי מובנה ומה חדש בגרסה האחרונה",
+    rn_heading: "עדכון אוטומטי מובנה והיסטוריית גרסאות (Changelog)",
     rn_default: "ImageCulling Studio בודק עדכונים אוטומטית בעלייה וכולל כפתור בדיקה והתקנת עדכון בהגדרות — מבלי לפגוע במסד הנתונים, במודלים או בתמונות שלכם.",
+    rn_latest_pill: "הגרסה האחרונה",
+    rn_expand_all: "הצג את כל ההיסטוריה",
+    rn_collapse_all: "הצג גרסה אחרונה בלבד",
     contact_heading: "יצירת קשר ושליחת פידבק",
     contact_sub: "יש לכם רעיון לפיצ׳ר, דיווח על באג או פידבק מיום הצילום? אשמח לשמוע מכם.",
     form_title: "שליחת פידבק",
@@ -1040,7 +1148,180 @@ function applyLanguage(lang) {
   if (CONFIG.feedbackEndpoint) {
     document.getElementById("btnSubmitFeedback").textContent = dict.btn_send_direct;
   }
+  renderChangelog();
   setVideoLanguage(currentLang);
+}
+
+// Built-in bilingual changelog fallback + simplified Hebrew translations by version
+const FALLBACK_CHANGELOG_EN = [
+  {
+    version: "1.1.0",
+    date: "2026-11-25",
+    body: `### Added
+- **Auto Smart Straighten & Composition-Aware Smart Crop (\`src/smart_crop.py\`):**
+  - Multi-candidate composition evaluator scoring Rule of Thirds (Left/Right with gaze lead room), Golden Ratio, Upper-Third Center, Centered Subject, and Full Frame (never clipping wings/tails), plus background edge-clutter avoidance.
+  - Multi-horizon / waterline detector returning up to 5 optional horizon candidates with live cyan guide preview and one-click reselection (plus \`0.0° Level / None\`).
+  - Bird-size-aware framing with a \`2700px\` minimum long-side resolution floor (computed from true full-resolution sensor dimensions) and locked aspect ratio by default (with free-ratio toggle and quick presets).
+  - Non-destructive Lightroom Classic \`crs:Crop*\` & \`crs:CropAngle\` XMP sync with full \`Ctrl+Z\` Undo.
+  - Automatic unapplied suggestion previews (faint gray border) for Layer 2 / Green images, plus single-image and batch **Smart Crop / Reset** controls, interactive drag/resize/angle editing, composition rule badge, and double-click reset in Loupe.
+
+### Improved
+- **Smarter Action-Burst Selection (\`src/scene_burst_and_select.py\`):** Keeping an entire burst (\`action_sequence\`) now requires genuine dynamic motion/shape evolution (such as takeoffs, landings, vigorous wingbeats, or pose shifts) rather than steady flat glides or static perched poses.
+- **Minimum 1 Keep Per Burst:** Every multi-frame wildlife/landscape burst now retains at least its single highest-scoring frame in Layer 1 (\`Keep\`) unless all frames in the burst are genuinely bad (\`to_delete\`).`,
+  },
+  {
+    version: "1.0.0",
+    date: "2026-11-24",
+    body: `### Added
+- **Full-Dataset Two-Track AI Culling Pipeline:** Project Kestrel (MegaDetector + SAM-HQ ViT-Tiny + BioCLIP 2 + AnimalGate + QualityClassifier) paired with SigLIP 2 (\`google/siglip2-so400m-patch14-384\`) across 100% of images.
+- **Wildlife & Landscape Routing:** Separate scoring tracks for Wildlife/Birds and Sun/Sunrise/Sunset/Landscape, with a \`+15%\` Hybrid Light bonus for environmental wildlife shots.
+- **Scenario-Driven Selection:** \`>= 10%\` zoom-change scenario splitting, full-sequence retention for strong flying/action sequences, distinct pose/phase promotion for Layer 2 Edit picks, and zero hardcoded count quotas.
+- **Personalized LightGBM Ranker (\`train_ranker.py\`):** Learns from your Keep/Edit/Reject overrides and blends personal preferences into future shoots.
+- **Cross-Platform GPU Support:** NVIDIA CUDA & DirectML on Windows, Apple Silicon MPS & CoreML on macOS, plus CPU fallback.
+- **One-Click Installers & Auto-Updater:** Zero-Git installers for Windows (\`Install_Windows.bat\`) and macOS (\`Install_MacOS.command\`), release ZIP packager (\`scripts/build_release.py\`), and automatic GitHub Releases update checker/installer.`,
+  },
+];
+
+const CHANGELOG_HE_BY_VERSION = {
+  "1.1.0": `### מה חדש בגרסה
+- **חיתוך ויישור חכם אוטומטי (Smart Crop & Straighten):**
+  - בוחר אוטומטית את הקומפוזיציה הטובה ביותר (חוק השלישים עם מרווח מבט, יחס הזהב, מרכז עליון או מסגור מלא בלי לחתוך כנפיים).
+  - מזהה עד 5 קווי אופק/מים אפשריים ובוחר את המדויק ביותר — עם אפשרות להחליף קו אופק בקליק.
+  - מחשב גודל חיתוך לפי גודל הציפור בפריים עם רצפה של לפחות \`2700px\` בצד הארוך ויחס תמונה נעול כברירת מחדל.
+  - תצוגה מקדימה אפורה עדינה לתמונות ירוקות (Layer 2), עריכה ידנית וסיבוב, איפוס בדאבל-קליק, וסנכרון מלא ולא-הרסני ל-Lightroom (\`crs:Crop*\` + \`Ctrl+Z\`).
+
+### שיפורים
+- **בחירת רצפי תעופה חכמה יותר:** שמירת רצף שלם מתבצעת רק כשיש תנועה או שינוי פוזה אמיתי (כמו המראה, נחיתה או נפנוף כנפיים), ולא בגלישה אחידה.
+- **לפחות תמונת Keep אחת בכל רצף:** כל רצף שומר לפחות את התמונה הטובה ביותר בו, אלא אם כל התמונות ברצף פסולות.`,
+  "1.0.0": `### מה נכלל בגרסה הראשונה
+- **סינון AI דו-מסלולי מקומי על ה-GPU:** שילוב מלא של Project Kestrel ו-SigLIP 2 על 100% מהתמונות.
+- **מסלול חיות בר + מסלול זריחות ונופים:** כולל בונוס \`+15%\` לתמונות טבע באור שעת זהב.
+- **חלוקת סצנות חכמה:** פיצול אוטומטי בשינוי זום של \`>= 10%\`, שמירת רצפי אקשן טובים, וקידום תמונה מובילה לכל פוזה לעריכה.
+- **מדרג אישי (LightGBM):** לומד מהתיקונים שלך (Keep / Edit / Reject) ומשפר את הדירוג בימי הצילום הבאים.
+- **התקנה בקליק ועדכון אוטומטי:** מתאימה ל-Windows (NVIDIA CUDA) ול-macOS (Apple Silicon) ללא צורך ב-Git או Python מותקן מראש.`,
+};
+
+let changelogEntries = FALLBACK_CHANGELOG_EN.slice();
+let showAllReleases = false;
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function formatInlineMd(text) {
+  let out = escapeHtml(text);
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  return out;
+}
+
+function renderMarkdownToHtml(md) {
+  const lines = String(md || "").replace(/\r\n/g, "\n").split("\n");
+  let html = "";
+  const listStack = [];
+
+  function closeListsTo(depth) {
+    while (listStack.length > depth) {
+      const tag = listStack.pop();
+      html += `</li></${tag}>`;
+    }
+  }
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      closeListsTo(0);
+      continue;
+    }
+    const hMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (hMatch) {
+      closeListsTo(0);
+      const lvl = hMatch[1].length;
+      const tag = lvl <= 3 ? "h5" : "h6";
+      html += `<${tag}>${formatInlineMd(hMatch[2])}</${tag}>`;
+      continue;
+    }
+    const liMatch = rawLine.match(/^(\s*)[-*]\s+(.*)$/);
+    if (liMatch) {
+      const indent = liMatch[1].length;
+      const level = indent >= 2 ? 2 : 1;
+      if (listStack.length < level) {
+        while (listStack.length < level) {
+          html += "<ul>";
+          listStack.push("ul");
+        }
+        html += `<li>${formatInlineMd(liMatch[2])}`;
+      } else {
+        if (listStack.length > level) {
+          closeListsTo(level);
+        }
+        html += `</li><li>${formatInlineMd(liMatch[2])}`;
+      }
+      continue;
+    }
+    closeListsTo(0);
+    html += `<p>${formatInlineMd(trimmed)}</p>`;
+  }
+  closeListsTo(0);
+  return html;
+}
+
+function parseChangelogMarkdown(mdText) {
+  const text = String(mdText || "").replace(/\r\n/g, "\n");
+  const headerRe = /^##\s+\[?v?([0-9]+\.[0-9]+\.[0-9]+[^\s\]]*)\]?(?:\s*[-–—]\s*([0-9]{4}-[0-9]{2}-[0-9]{2}))?[^\n]*$/gm;
+  const matches = [...text.matchAll(headerRe)];
+  if (!matches.length) return [];
+  return matches.map((m, i) => {
+    const start = m.index + m[0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
+    return {
+      version: m[1],
+      date: m[2] || "",
+      body: text.slice(start, end).trim(),
+    };
+  });
+}
+
+function renderChangelog() {
+  const listEl = document.getElementById("releaseNotesList");
+  const toggleBtn = document.getElementById("btnToggleAllReleases");
+  if (!listEl) return;
+
+  const dict = I18N[currentLang];
+  if (toggleBtn) {
+    toggleBtn.textContent = showAllReleases ? dict.rn_collapse_all : dict.rn_expand_all;
+    toggleBtn.style.display = changelogEntries.length > 1 ? "inline-flex" : "none";
+  }
+
+  listEl.innerHTML = changelogEntries
+    .map((entry, idx) => {
+      const isOpen = idx === 0 || showAllReleases;
+      const heBody = currentLang === "he" ? CHANGELOG_HE_BY_VERSION[entry.version] : null;
+      const rawBody = heBody || entry.body;
+      const formattedHtml = renderMarkdownToHtml(rawBody);
+      const latestPill = idx === 0 ? `<span class="rn-latest-pill">${escapeHtml(dict.rn_latest_pill)}</span>` : "";
+      const dateSpan = entry.date ? `<span class="rn-date">${escapeHtml(entry.date)}</span>` : "";
+      const langFallbackTag = (currentLang === "he" && !heBody) ? `<span class="badge" style="font-size:0.68rem;">EN</span>` : "";
+      return `
+        <details class="rn-entry" ${isOpen ? "open" : ""}>
+          <summary>
+            <span class="rn-sum-left">
+              <span class="rn-chevron">▶</span>
+              <span class="rn-ver-badge">v${escapeHtml(entry.version)}</span>
+              ${latestPill}
+              ${langFallbackTag}
+            </span>
+            ${dateSpan}
+          </summary>
+          <div class="rn-body">${formattedHtml}</div>
+        </details>
+      `;
+    })
+    .join("");
 }
 
 function toYouTubeEmbedUrl(url) {
@@ -1136,29 +1417,44 @@ function setVideoLanguage(lang) {
 
 async function fetchLatestRelease() {
   try {
-    const resp = await fetch(`https://api.github.com/repos/${CONFIG.githubRepo}/releases/latest`, {
-      headers: { Accept: "application/vnd.github+json" },
-    });
-    if (!resp.ok) return;
-    const rel = await resp.json();
-    const tag = rel.tag_name || "v1.0.0";
-    const assets = rel.assets || [];
-    const zipAsset = assets.find(a => (a.name || "").toLowerCase().endsWith(".zip") && !(a.name || "").toLowerCase().includes("model"));
-    const dlUrl = (zipAsset && zipAsset.browser_download_url) || rel.html_url;
+    const [relResp, clResp] = await Promise.allSettled([
+      fetch(`https://api.github.com/repos/${CONFIG.githubRepo}/releases/latest`, {
+        headers: { Accept: "application/vnd.github+json" },
+      }),
+      fetch(`https://raw.githubusercontent.com/${CONFIG.githubRepo}/main/CHANGELOG.md`),
+    ]);
 
-    if (dlUrl) {
-      document.getElementById("btnHeroDownload").href = dlUrl;
-      document.getElementById("btnSectionDownload").href = dlUrl;
+    if (relResp.status === "fulfilled" && relResp.value.ok) {
+      const rel = await relResp.value.json();
+      const tag = rel.tag_name || "v1.1.0";
+      const assets = rel.assets || [];
+      const zipAsset = assets.find(a => (a.name || "").toLowerCase().endsWith(".zip") && !(a.name || "").toLowerCase().includes("model"));
+      const dlUrl = (zipAsset && zipAsset.browser_download_url) || rel.html_url;
+
+      if (dlUrl) {
+        document.getElementById("btnHeroDownload").href = dlUrl;
+        document.getElementById("btnSectionDownload").href = dlUrl;
+      }
+      document.getElementById("heroVersionBadge").textContent = `${tag} · Free & Open Source (AGPL-3.0)`;
     }
-    document.getElementById("heroVersionBadge").textContent = `${tag} · Free & Open Source (AGPL-3.0)`;
-    if (rel.body && rel.body.trim()) {
-      document.getElementById("releaseNotesHeading").textContent = `${rel.name || tag} — Release Notes`;
-      document.getElementById("releaseNotesBody").textContent = rel.body.trim();
+
+    if (clResp.status === "fulfilled" && clResp.value.ok) {
+      const md = await clResp.value.text();
+      const parsed = parseChangelogMarkdown(md);
+      if (parsed.length) {
+        changelogEntries = parsed;
+        renderChangelog();
+      }
     }
   } catch {
-    // Keep clean default links when offline or before first release is published
+    // Keep clean built-in changelog & links when offline
   }
 }
+
+document.getElementById("btnToggleAllReleases").addEventListener("click", () => {
+  showAllReleases = !showAllReleases;
+  renderChangelog();
+});
 
 document.getElementById("btnLangEN").addEventListener("click", () => applyLanguage("en"));
 document.getElementById("btnLangHE").addEventListener("click", () => applyLanguage("he"));

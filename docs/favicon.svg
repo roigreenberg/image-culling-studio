@@ -1,13 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#f5b942"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#131926"/>
+      <stop offset="100%" stop-color="#0b0d12"/>
+    </linearGradient>
+    <linearGradient id="bird" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fbcf6b"/>
+      <stop offset="55%" stop-color="#f5b942"/>
       <stop offset="100%" stop-color="#34d399"/>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="14" fill="url(#g)"/>
-  <g transform="translate(12,12) scale(1.667)" fill="none" stroke="#0b0d12" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="12" cy="12" r="9"/>
-    <path d="M14.31 8l5.74 9.94M9.69 8h11.48M7.38 12l5.74-9.94M9.69 16L3.95 6.06M14.31 16H2.83M16.62 12l-5.74 9.94"/>
-  </g>
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="13.5" fill="none" stroke="url(#bird)" stroke-opacity="0.45" stroke-width="2"/>
+  <!-- Clean flying bird silhouette with clear beak, head, swept wing, and tail -->
+  <path fill="url(#bird)" d="M55 24l-8-1.5c-1.8-2.8-5.2-4.2-8.5-3.3-1.4.4-2.6 1.2-3.5 2.2C30.5 14 21 9.5 10 11c4.5 3.6 8 8.2 9.8 13.5-3.8 1.5-7 4-9.3 7.2 4.5-1.2 9-1.2 13 .2-2.2 3.8-3.8 8-4.5 12.6 4.8-2.8 9.2-6.5 12.8-10.8 4.4.8 9.2-.3 12.6-3.2 2-1.7 3.3-3.9 4-6.3L55 24z"/>
+  <circle cx="43.2" cy="22.8" r="1.5" fill="#0b0d12"/>
 </svg>
