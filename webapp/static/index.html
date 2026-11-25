@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ImageCulling Studio — Fast Wildlife & Bird Culling</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261124b" />
+  <link rel="stylesheet" href="/static/styles.css?v=20261125e" />
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -76,6 +76,18 @@
           <button class="btn-seg" data-view="compare" title="Winner vs Challenger Compare (C)">◫ Winner vs Challenger</button>
         </div>
         <button id="btnUndo" class="btn btn-ghost btn-sm" title="Undo last rating/color/XMP change (Ctrl+Z)">↩ Undo</button>
+        <div class="bookmark-menu-wrap">
+          <button id="btnBookmarksMenu" class="btn btn-ghost btn-sm" title="Save & jump back to bookmarked positions in any view">🔖 Bookmarks <span id="bookmarkCountBadge" class="bm-count-badge hidden">0</span></button>
+          <div id="bookmarksDropdown" class="dropdown bm-dropdown hidden">
+            <div class="bm-add-row">
+              <input id="inputBookmarkLabel" type="text" class="text-input xs" placeholder="Optional note (e.g. Osprey dive)..." />
+              <button id="btnAddBookmark" class="btn btn-xs btn-primary" title="Save current view, burst & image as a bookmark">+ Bookmark Here</button>
+            </div>
+            <div id="bookmarksList" class="bm-list">
+              <div class="bm-empty muted">No bookmarks yet. Click "+ Bookmark Here" to save your spot!</div>
+            </div>
+          </div>
+        </div>
         <button id="btnLogs" class="btn btn-ghost btn-sm" title="Live Logs, Pipeline Runs & Change Restore">📜 Logs &amp; Restore</button>
         <button id="btnLearning" class="btn btn-ghost btn-sm" title="AI vs User Learning Insights">🧠 Insights</button>
         <button id="btnSettings" class="btn btn-ghost btn-sm" title="XMP Sync & Studio Settings">⚙ Settings</button>
@@ -231,6 +243,8 @@
               <button class="btn btn-xs" data-batch-label="Yellow" title="Mark selected as Yellow (Keep)">🟡</button>
               <button class="btn btn-xs" data-batch-label="Red" title="Mark selected as Red (To Delete)">🔴</button>
               <button class="btn btn-xs btn-accent" id="btnBatchCull" title="Re-run GPU AI culling only on the selected photos">⚡ Cull Selected</button>
+              <button class="btn btn-xs btn-primary" id="btnBatchSmartCrop" title="Calculate (if needed) and apply Auto Smart Straighten & Crop to all selected photos (writes Lightroom XMP)">✂ Smart Crop</button>
+              <button class="btn btn-xs btn-ghost" id="btnBatchResetCrop" title="Clear/reset crop & straighten on all selected photos">↺ Reset Crop</button>
               <button class="btn btn-xs btn-ghost" id="btnClearSel" title="Clear multi-selection">Clear</button>
             </div>
             <label class="sort-wrap" title="Sort images in Grid and Loupe roll">
@@ -324,12 +338,27 @@
               <div class="loupe-img-wrap" id="loupeImgWrap">
                 <img id="loupeImg" class="loupe-img" alt="" draggable="false" />
                 <canvas id="loupeOverlay" class="loupe-overlay"></canvas>
+                <div id="loupeCropLayer" class="loupe-crop-layer hidden">
+                  <div id="loupeCropBox" class="loupe-crop-box" title="Drag to move · Drag handles to resize · Drag outside or ↻ knob to rotate · Double-click to reset · Enter to apply">
+                    <div class="crop-grid-lines"></div>
+                    <div class="crop-rotate-stem"></div>
+                    <div class="crop-rotate-handle" data-handle="rotate" title="Drag to rotate crop frame · Double-click to reset angle to 0°">↻</div>
+                    <div class="crop-handle h-nw" data-handle="nw"></div>
+                    <div class="crop-handle h-ne" data-handle="ne"></div>
+                    <div class="crop-handle h-sw" data-handle="sw"></div>
+                    <div class="crop-handle h-se" data-handle="se"></div>
+                    <div class="crop-handle h-n" data-handle="n"></div>
+                    <div class="crop-handle h-s" data-handle="s"></div>
+                    <div class="crop-handle h-e" data-handle="e"></div>
+                    <div class="crop-handle h-w" data-handle="w"></div>
+                  </div>
+                </div>
               </div>
               <button id="btnLoupeNext" class="loupe-nav next" title="Next (→)">›</button>
 
               <!-- Floating Loupe HUD -->
               <div class="loupe-hud-top">
-                <span id="loupeCounter" class="hud-chip strong">0 / 0</span>
+                <span id="loupeCounter" class="hud-chip strong jump-chip" title="Click to type an image number and jump straight there">0 / 0</span>
                 <span id="loupeFilename" class="hud-chip strong"></span>
                 <span id="loupeLayerPill" class="hud-chip"></span>
                 <span id="loupeSpeedPill" class="hud-chip"></span>
@@ -347,6 +376,7 @@
                 <button id="btnToggleAf" class="hud-btn active" title="Show/hide camera AF focus area (F)">🎯 AF (F)</button>
                 <button id="btnToggleHighlights" class="hud-btn active" title="Toggle gentle burned highlights zebra overlay (H)">☀ Highlights (H)</button>
                 <button id="btnToggleBbox" class="hud-btn" title="Toggle YOLO Subject & Head Box (B)">📦 AI Box (B)</button>
+                <button id="btnToggleCropEdit" class="hud-btn" title="Toggle Interactive Smart Straighten & Crop Editor (R)">✂ Crop (R)</button>
                 <button id="btnLoupeSplitBurst" class="hud-btn hidden" title="Split burst starting at this image (S)">✂ Split Burst (S)</button>
                 <button id="btnLoupeUnsplitBurst" class="hud-btn hidden" title="Merge this split burst back into the previous burst">🔗 Merge Back</button>
                 <button id="btnLoupeCompareBurst" class="hud-btn" title="Compare this burst side-by-side (C)">◫ Burst</button>
@@ -366,6 +396,50 @@
 
             <!-- RIGHT INSPECTOR -->
             <aside class="inspector">
+              <div class="insp-section" id="inspSmartCropSection">
+                <div class="insp-title-row">
+                  <span class="insp-title" style="margin:0">✂ Smart Straighten &amp; Crop</span>
+                  <span id="cropStatusBadge" class="crop-status-pill">None</span>
+                </div>
+                <div class="crop-action-row">
+                  <button id="btnCropAuto" class="btn btn-xs btn-ghost" title="Calculate (or recompute) AI Smart Straighten & Crop suggestion">✨ Auto</button>
+                  <button id="btnCropApply" class="btn btn-xs btn-primary" title="Apply crop & straighten and write Lightroom crs:Crop* XMP">✔ Apply</button>
+                  <button id="btnCropEditBtn" class="btn btn-xs btn-ghost" title="Toggle interactive crop handles on photo (R)">✎ Edit</button>
+                  <button id="btnCropReset" class="btn btn-xs btn-ghost" title="Clear crop & straighten back to full frame (or double-click crop box)">↺ Reset</button>
+                </div>
+
+                <div class="crop-size-row">
+                  <span id="cropSizeReadout" class="crop-size-text">— × — px</span>
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <span id="cropRuleBadge" class="crop-rule-badge hidden" title="Composition rule chosen by Auto Smart Crop"></span>
+                    <span id="cropMinClampBadge" class="crop-clamp-badge hidden" title="Clamped at minimum 2700px long side">Min 2700px</span>
+                  </div>
+                </div>
+
+                <div class="crop-angle-row" title="Drag to fine-tune straighten angle (-15° to +15°) · Double-click slider to reset to 0°">
+                  <label class="crop-angle-label" id="cropAngleLabel">Angle:</label>
+                  <input id="cropAngleSlider" type="range" min="-15" max="15" step="0.1" value="0" class="crop-angle-slider" />
+                  <input id="cropAngleInput" type="number" min="-15" max="15" step="0.1" value="0.0" class="text-input crop-angle-num" />
+                  <span class="muted">°</span>
+                </div>
+
+                <div class="crop-ratio-row">
+                  <button id="btnCropLockRatio" class="btn btn-xs btn-ghost active" title="Lock aspect ratio while resizing corners">🔒 Locked</button>
+                  <div class="crop-ratio-presets" id="cropRatioPresets">
+                    <button class="crp-btn active" data-ratio="orig" title="Original camera aspect ratio">Orig</button>
+                    <button class="crp-btn" data-ratio="1.5" title="3:2 ratio">3:2</button>
+                    <button class="crp-btn" data-ratio="1.7778" title="16:9 widescreen">16:9</button>
+                    <button class="crp-btn" data-ratio="0.8" title="4:5 vertical portrait">4:5</button>
+                    <button class="crp-btn" data-ratio="1.0" title="1:1 square">1:1</button>
+                  </div>
+                </div>
+
+                <div id="cropHorizonsWrap" class="crop-horizons-wrap hidden">
+                  <div class="crop-sublabel">Detected Horizons (click to select · hover to preview):</div>
+                  <div id="cropHorizonsList" class="crop-horizons-list"></div>
+                </div>
+              </div>
+
               <div class="insp-section">
                 <div class="insp-title">Head / Eye 1:1 Crop</div>
                 <div class="head-crop-box" id="inspCropBox" title="Click to toggle full zoom">
@@ -410,14 +484,17 @@
           <div class="compare-header">
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
               <strong id="compareTitle">Winner vs. Challenger</strong>
-              <span id="compareBurstCounter" class="hud-chip strong" title="Current burst position out of total bursts (includes single photos unless Multi-Frame filter is active)">Burst 0 / 0</span>
-              <span id="compareImageCounter" class="hud-chip strong" title="Current Challenger photo position out of total filtered/directory images">Image 0 / 0</span>
+              <span id="compareBurstCounter" class="hud-chip strong jump-chip" title="Click to type a burst number and jump straight there">Burst 0 / 0</span>
+              <span id="compareImageCounter" class="hud-chip strong jump-chip" title="Click to type an image number and jump straight there">Image 0 / 0</span>
               <span id="compareDeltaBadge" class="hud-chip" title="Sharpness difference between Challenger (right) and Pinned Winner (left)"></span>
             </div>
             <div class="compare-actions">
+              <button id="btnWvcBookmark" class="btn btn-sm btn-ghost" title="Bookmark this exact Winner vs. Challenger burst & frame so you can jump back from anywhere">🔖 Bookmark</button>
               <button id="btnWvcPrevBurst" class="btn btn-sm btn-ghost" title="Previous Burst (↑)">↑ Prev Burst</button>
               <button id="btnWvcNextBurst" class="btn btn-sm btn-ghost" title="Next Burst (↓)">↓ Next Burst</button>
               <button id="btnWvcZoomToggle" class="btn btn-sm btn-ghost" title="Toggle Synced 100% Focus Zoom (Z)">🔍 Synced Zoom (Z)</button>
+              <button id="btnWvcToggleAf" class="btn btn-sm btn-ghost active" title="Show/hide camera AF focus area on both panes (F)">🎯 AF (F)</button>
+              <button id="btnWvcToggleHighlights" class="btn btn-sm btn-ghost active" title="Toggle gentle burned highlights zebra overlay on both panes (H)">☀ Highlights (H)</button>
               <button id="btnWvcSwap" class="btn btn-sm btn-primary" title="Swap: promote Challenger to Winner's color & demote old Winner (S)">⇄ Swap Winner (S)</button>
               <button id="btnWvcKeepBoth" class="btn btn-sm btn-accent" title="Keep Both: give Challenger the Winner's color too (K)">✚ Keep Both (K)</button>
               <button id="btnCompareExit" class="btn btn-sm btn-ghost">✕ Back</button>
@@ -435,6 +512,7 @@
               <div class="wvc-stage" id="wvcLeftStage">
                 <div class="wvc-img-wrap" id="wvcLeftWrap">
                   <img id="wvcWinImg" alt="Winner" draggable="false" />
+                  <canvas id="wvcWinOverlay" class="loupe-overlay"></canvas>
                 </div>
               </div>
               <div class="wvc-pane-foot" id="wvcWinControls"></div>
@@ -454,6 +532,7 @@
                 <button id="btnWvcChalPrev" class="loupe-nav prev" title="Previous frame in burst (←)">‹</button>
                 <div class="wvc-img-wrap" id="wvcRightWrap">
                   <img id="wvcChalImg" alt="Challenger" draggable="false" />
+                  <canvas id="wvcChalOverlay" class="loupe-overlay"></canvas>
                 </div>
                 <button id="btnWvcChalNext" class="loupe-nav next" title="Next frame in burst (→)">›</button>
               </div>
@@ -769,6 +848,6 @@
   <!-- TOAST -->
   <div id="toast" class="toast hidden"></div>
 
-  <script src="/static/app.js?v=20261124b"></script>
+  <script src="/static/app.js?v=20261125f"></script>
 </body>
 </html>

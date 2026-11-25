@@ -185,6 +185,67 @@ class TestSceneBurstAndSelect(unittest.TestCase):
         self.assertTrue(all(ly in ("layer1_keep", "layer2_to_edit") for ly in s5_layers))
         self.assertEqual(records[0]["overall_rank"] > 0, True)
 
+    def test_steady_glide_not_kept_as_action_sequence_while_takeoff_is(self) -> None:
+        # Steady flat glide (like S0259): high action_score but constant bbox aspect ratio & near-identical embeddings
+        steady_embs = np.tile(_unit_vec(8, 0), (10, 1))
+        steady = [
+            {
+                "burst_id": "S_GLIDE",
+                "track": "Wildlife",
+                "overall_score": 75.0,
+                "sharpness_score": 70.0,
+                "action_score": 72.0,
+                "bbox": [1000 + i * 20, 1400, 2800 + i * 20, 1720],
+                "timestamp": 100.0 + i * 0.05,
+                "_emb_idx": i,
+            }
+            for i in range(10)
+        ]
+        self.assertFalse(_is_long_action_sequence(steady, siglip_embs=steady_embs))
+
+        # Genuine takeoff / wing-flap sequence: bbox aspect ratio transforms dramatically as wings open & flap
+        takeoff = [
+            {
+                "burst_id": "S_TAKEOFF",
+                "track": "Wildlife",
+                "overall_score": 78.0,
+                "sharpness_score": 70.0,
+                "action_score": 45.0 if i < 3 else 86.0,
+                "bbox": [1500, 1200, 1850, 1950] if i < 3 else [1100, 1000, 2600, 1600],
+                "timestamp": 200.0 + i * 0.05,
+            }
+            for i in range(8)
+        ]
+        self.assertTrue(_is_long_action_sequence(takeoff))
+
+    def test_burst_keeps_at_least_one_unless_all_bad(self) -> None:
+        cfg = PipelineConfig()
+        records = [
+            # Burst of 3 decent (below keep threshold, but not bad/to_delete) wildlife frames -> best 1 kept!
+            {
+                "burst_id": "S_OK", "track": "Wildlife",
+                "overall_score": 48.0 + i, "sharpness_score": 44.0,
+                "action_score": 30.0, "scenic_score": 10.0, "kestrel_quality": 0.75, "tonal_balance": 0.6,
+                "timestamp": 1.0 + i * 0.1,
+            }
+            for i in range(3)
+        ] + [
+            # Burst of 3 genuinely bad (blurry) wildlife frames -> all to_delete, 0 kept!
+            {
+                "burst_id": "S_BAD", "track": "Wildlife",
+                "overall_score": 25.0, "sharpness_score": 20.0,
+                "action_score": 10.0, "scenic_score": 5.0, "kestrel_quality": 0.2, "tonal_balance": 0.3,
+                "exposure_seconds": 0.001, "timestamp": 10.0 + i * 0.1,
+            }
+            for i in range(3)
+        ]
+        select_layers_final(records, cfg)
+        ok_layers = [r["layer"] for r in records if r["burst_id"] == "S_OK"]
+        bad_layers = [r["layer"] for r in records if r["burst_id"] == "S_BAD"]
+        self.assertEqual(ok_layers.count("layer1_keep"), 1)
+        self.assertEqual(bad_layers.count("layer1_keep"), 0)
+        self.assertEqual(bad_layers.count("to_delete"), 3)
+
     def test_apply_personal_ranker_if_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model_path = Path(tmp) / "personal_ranker.pkl"

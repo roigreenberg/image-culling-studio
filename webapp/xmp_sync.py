@@ -36,6 +36,21 @@ _RE_ATTR_PM_COLOR = re.compile(r'\bphotomechanic:ColorClass\s*=\s*"(\d+)"', re.I
 _RE_ATTR_META_DATE = re.compile(r'\bxmp:MetadataDate\s*=\s*"([^"]*)"', re.IGNORECASE)
 _RE_RDF_DESC_OPEN = re.compile(r"(<rdf:Description\b[^>]*?)(/?>)", re.DOTALL)
 
+_CRS_NS = 'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"'
+_CRS_CROP_ATTRS = (
+    "HasCrop",
+    "CropTop",
+    "CropLeft",
+    "CropBottom",
+    "CropRight",
+    "CropAngle",
+    "CropConstrainToWarp",
+)
+_RE_CRS_ATTRS = {
+    name: re.compile(rf'\bcrs:{name}\s*=\s*"([^"]*)"', re.IGNORECASE)
+    for name in _CRS_CROP_ATTRS
+}
+
 _PM_COLOR_TO_LABEL = {"0": "", "1": "Red", "2": "Yellow", "3": "Green", "4": "Blue", "5": "Purple"}
 _LABEL_TO_PM_COLOR = {v: k for k, v in _PM_COLOR_TO_LABEL.items()}
 
@@ -90,6 +105,12 @@ def parse_xmp_text(xml_text: str) -> Dict[str, Any]:
     return {"rating": rating, "label": label}
 
 
+def parse_xmp_has_crop(xml_text: str) -> bool:
+    """Return True if an XMP string declares crs:HasCrop="True"."""
+    m_hc = _RE_CRS_ATTRS["HasCrop"].search(xml_text or "")
+    return bool(m_hc and m_hc.group(1).strip().lower() == "true")
+
+
 def read_xmp_sidecar(image_path: Path) -> Dict[str, Any]:
     """Read an image's .xmp sidecar if it exists."""
     xmp_path = get_xmp_path(image_path)
@@ -110,7 +131,55 @@ def read_xmp_sidecar(image_path: Path) -> Dict[str, Any]:
         return {"exists": False, "path": str(xmp_path), "rating": None, "label": None, "raw_xml": None}
 
 
-def _create_minimal_xmp(rating: Optional[int], label: Optional[str], now_iso: str) -> str:
+def _set_crs_attr(xml_text: str, name: str, value: str) -> str:
+    pat = _RE_CRS_ATTRS[name]
+    if pat.search(xml_text):
+        return pat.sub(f'crs:{name}="{value}"', xml_text, count=1)
+    m = _RE_RDF_DESC_OPEN.search(xml_text)
+    if m:
+        return xml_text[: m.start(2)] + f'\n   crs:{name}="{value}"' + xml_text[m.start(2) :]
+    return xml_text
+
+
+def _apply_crop_to_xmp(xml_text: str, crop: Optional[Dict[str, Any]]) -> str:
+    if crop is None:
+        return xml_text
+    updated = xml_text
+    if "xmlns:crs=" not in updated:
+        m = _RE_RDF_DESC_OPEN.search(updated)
+        if m:
+            updated = updated[: m.start(2)] + f"\n   {_CRS_NS}" + updated[m.start(2) :]
+
+    applied = bool(crop.get("applied", False))
+    if applied:
+        left = max(0.0, min(1.0, float(crop.get("left", 0.0))))
+        top = max(0.0, min(1.0, float(crop.get("top", 0.0))))
+        right = max(0.0, min(1.0, float(crop.get("right", 1.0))))
+        bottom = max(0.0, min(1.0, float(crop.get("bottom", 1.0))))
+        angle = max(-45.0, min(45.0, float(crop.get("angle", 0.0))))
+        updated = _set_crs_attr(updated, "HasCrop", "True")
+        updated = _set_crs_attr(updated, "CropTop", f"{top:.6f}")
+        updated = _set_crs_attr(updated, "CropLeft", f"{left:.6f}")
+        updated = _set_crs_attr(updated, "CropBottom", f"{bottom:.6f}")
+        updated = _set_crs_attr(updated, "CropRight", f"{right:.6f}")
+        updated = _set_crs_attr(updated, "CropAngle", f"{angle:.4f}")
+        updated = _set_crs_attr(updated, "CropConstrainToWarp", "0")
+    else:
+        updated = _set_crs_attr(updated, "HasCrop", "False")
+        updated = _set_crs_attr(updated, "CropTop", "0")
+        updated = _set_crs_attr(updated, "CropLeft", "0")
+        updated = _set_crs_attr(updated, "CropBottom", "1")
+        updated = _set_crs_attr(updated, "CropRight", "1")
+        updated = _set_crs_attr(updated, "CropAngle", "0")
+    return updated
+
+
+def _create_minimal_xmp(
+    rating: Optional[int],
+    label: Optional[str],
+    now_iso: str,
+    crop: Optional[Dict[str, Any]] = None,
+) -> str:
     attrs = [
         'rdf:about=""',
         'xmlns:xmp="http://ns.adobe.com/xap/1.0/"',
@@ -121,16 +190,23 @@ def _create_minimal_xmp(rating: Optional[int], label: Optional[str], now_iso: st
     if label:
         attrs.append(f'xmp:Label="{label}"')
     attr_block = "\n   ".join(attrs)
-    return (
+    base = (
         '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Antigravity ImageCulling Studio 1.0">\n'
         ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
         f"  <rdf:Description\n   {attr_block}/>\n"
         " </rdf:RDF>\n"
         "</x:xmpmeta>\n"
     )
+    return _apply_crop_to_xmp(base, crop)
 
 
-def _update_existing_xmp(xml_text: str, rating: Optional[int], label: Optional[str], now_iso: str) -> str:
+def _update_existing_xmp(
+    xml_text: str,
+    rating: Optional[int],
+    label: Optional[str],
+    now_iso: str,
+    crop: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     Update ONLY xmp:Rating, xmp:Label, and xmp:MetadataDate in an existing XMP file,
     preserving all Lightroom Develop settings, crops, masks, keywords, etc.
@@ -196,6 +272,7 @@ def _update_existing_xmp(xml_text: str, rating: Optional[int], label: Optional[s
                 + updated[m.start(2) :]
             )
 
+    updated = _apply_crop_to_xmp(updated, crop)
     return updated
 
 
@@ -203,9 +280,10 @@ def write_xmp_sidecar(
     image_path: Path,
     rating: Optional[int] = None,
     label: Optional[str] = None,
+    crop: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
-    Atomically write rating/label to the .xmp sidecar alongside image_path.
+    Atomically write rating/label/crop to the .xmp sidecar alongside image_path.
     Returns (success, previous_xml_or_none, new_xml_or_none, error_message_or_none).
     """
     xmp_path = get_xmp_path(image_path)
@@ -217,9 +295,9 @@ def write_xmp_sidecar(
     try:
         if xmp_path.exists():
             prev_xml = xmp_path.read_text(encoding="utf-8", errors="replace")
-            new_xml = _update_existing_xmp(prev_xml, rating, label, now_iso)
+            new_xml = _update_existing_xmp(prev_xml, rating, label, now_iso, crop=crop)
         else:
-            new_xml = _create_minimal_xmp(rating, normalize_label(label) if label else None, now_iso)
+            new_xml = _create_minimal_xmp(rating, normalize_label(label) if label else None, now_iso, crop=crop)
 
         tmp_path = xmp_path.with_suffix(".xmp.tmp")
         tmp_path.write_text(new_xml, encoding="utf-8")

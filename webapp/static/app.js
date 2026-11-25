@@ -50,6 +50,7 @@
     offset: 0,
     loading: false,
     selectedIds: new Set(),
+    lastSelectedIdx: -1,
     activeIndex: 0,
     burstSiblings: [],
     filmstripMode: "list", // "list" | "burst"
@@ -64,6 +65,7 @@
     showBbox: false,
     highlightMaskCanvas: null,
     highlightMaskKey: "",
+    highlightMaskCache: new Map(),
     highlightClipPct: 0,
     isDragging: false,
     dragMoved: false,
@@ -88,8 +90,12 @@
     wvcFrames: [],
     wvcWinnerIdx: 0,
     wvcChalIdx: 0,
+    wvcSelectedIds: new Set(),
+    wvcAnchorIdx: 0,
     wvcBurstPos: 0,
     wvcTotalBursts: 0,
+    wvcPrevBurstId: "",
+    wvcNextBurstId: "",
     wvcFirstImgPos: 0,
     wvcTotalImgs: 0,
     wvcZoomed: false,
@@ -104,9 +110,14 @@
     wvcDragStartPanY: 0,
     wvcReturnView: "grid",
     ws: null,
+    bookmarks: [],
     versionInfo: null,
     updateInfo: null,
     updatingApp: false,
+    cropEditMode: false,
+    cropDraft: null,
+    cropHoverHorizonIdx: null,
+    cropDrag: null,
     preloadCache: new Map(),
     fullPreloadCache: new Map(),
     loupeLoadedFullId: "",
@@ -322,6 +333,10 @@
           if (msg.dir_id === state.currentDirId) {
             refreshDirectoryAndImages();
           }
+        } else if (msg.type === "smart_crop_ready") {
+          if (msg.dir_id === state.currentDirId) {
+            handleSmartCropReadyWs(msg.image_ids || []);
+          }
         }
       } catch (_) {}
     };
@@ -446,6 +461,7 @@
     updateLayerBadges(dir);
     await loadFacets();
     loadManualSplits(dirId);
+    loadBookmarks(dirId);
     syncFilterControlsFromState();
 
     // Load enough images to restore exact previous scroll position or active picture cleanly
@@ -746,10 +762,37 @@
     $("photoGrid").appendChild(frag);
   }
 
+  function hasVisibleCrop(crop) {
+    if (!crop) return false;
+    const l = Number(crop.left ?? 0);
+    const t = Number(crop.top ?? 0);
+    const r = Number(crop.right ?? 1);
+    const b = Number(crop.bottom ?? 1);
+    const ang = Number(crop.angle ?? 0);
+    return (l > 0.002 || t > 0.002 || r < 0.998 || b < 0.998 || Math.abs(ang) >= 0.05);
+  }
+
+  function renderCardCropOverlayHtml(img) {
+    const c = img && img.crop;
+    if (!hasVisibleCrop(c)) return "";
+    const l = (Math.max(0, Math.min(1, Number(c.left ?? 0))) * 100).toFixed(2);
+    const t = (Math.max(0, Math.min(1, Number(c.top ?? 0))) * 100).toFixed(2);
+    const w = (Math.max(0.02, Math.min(1, Number(c.right ?? 1) - Number(c.left ?? 0))) * 100).toFixed(2);
+    const h = (Math.max(0.02, Math.min(1, Number(c.bottom ?? 1) - Number(c.top ?? 0))) * 100).toFixed(2);
+    const ang = Number(c.angle ?? 0);
+    const applied = !!(c.applied || img.crop_applied);
+    const cls = applied ? "card-crop-rect applied" : "card-crop-rect";
+    const badge = applied
+      ? `<span class="card-crop-badge" title="Crop applied (${Math.round(c.crop_width_px || 0)}×${Math.round(c.crop_height_px || 0)} px · ${ang.toFixed(1)}°)">✂ ${Math.abs(ang) >= 0.05 ? `${ang.toFixed(1)}°` : "Crop"}</span>`
+      : "";
+    return `<div class="${cls}" style="left:${l}%;top:${t}%;width:${w}%;height:${h}%;transform:rotate(${ang.toFixed(2)}deg)"></div>${badge}`;
+  }
+
   function createCardEl(img, idx) {
     const card = document.createElement("div");
     card.className = "photo-card" +
       (state.selectedIds.has(img.image_id) ? " selected" : "") +
+      (idx === state.activeIndex && state.selectedIds.size > 0 ? " main-selected" : "") +
       (img.effective_label ? ` label-${img.effective_label}` : "");
     card.dataset.id = img.image_id;
     card.dataset.idx = String(idx);
@@ -766,6 +809,7 @@
       <div class="card-thumb-wrap">
         <input type="checkbox" class="card-chk" ${state.selectedIds.has(img.image_id) ? "checked" : ""} />
         <img class="card-thumb" loading="lazy" decoding="async" src="/api/media/thumb/${encodeURIComponent(img.image_id)}" alt="${escapeHtml(img.filename)}" />
+        ${renderCardCropOverlayHtml(img)}
         <span class="card-layer-pill pill-${escapeHtml(dispLayer)}">${escapeHtml(layerLbl)}</span>
         ${canSplit ? `<button class="card-split-btn" style="top:28px" data-split-id="${escapeHtml(img.image_id)}" title="Split burst at #${img.burst_index}/${img.burst_size}">✂ Split</button>` : ""}
         ${canUnsplit ? `<button class="card-split-btn merge-btn" style="top:28px" data-unsplit-id="${escapeHtml(img.image_id)}" title="Merge split burst back">🔗 Merge</button>` : ""}
@@ -787,8 +831,14 @@
     const chk = card.querySelector(".card-chk");
     chk.addEventListener("click", (e) => {
       e.stopPropagation();
+      if (e.shiftKey) {
+        selectGridRange(idx, true);
+        return;
+      }
       toggleSelect(img.image_id, chk.checked);
-      card.classList.toggle("selected", chk.checked);
+      if (chk.checked && state.selectedIds.size === 1) state.activeIndex = idx;
+      state.lastSelectedIdx = idx;
+      syncGridSelectionDom();
     });
     const spBtn = card.querySelector("[data-split-id]");
     if (spBtn) spBtn.onclick = (e) => { e.stopPropagation(); splitBurstAt(img.image_id); };
@@ -796,14 +846,35 @@
     if (unspBtn) unspBtn.onclick = (e) => { e.stopPropagation(); unsplitBurstAt(img.image_id); };
 
     card.addEventListener("click", (e) => {
-      if (e.ctrlKey || e.metaKey) {
-        const next = !state.selectedIds.has(img.image_id);
-        toggleSelect(img.image_id, next);
-        chk.checked = next;
-        card.classList.toggle("selected", next);
+      if (e.shiftKey) {
+        e.preventDefault();
+        selectGridRange(idx, true);
         return;
       }
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        // Keep current main select included when starting a Ctrl multi-select
+        if (state.selectedIds.size === 0 && state.items[state.activeIndex]) {
+          state.selectedIds.add(state.items[state.activeIndex].image_id);
+        }
+        const next = !state.selectedIds.has(img.image_id);
+        toggleSelect(img.image_id, next);
+        if (next && state.selectedIds.size === 1) state.activeIndex = idx;
+        state.lastSelectedIdx = idx;
+        syncGridSelectionDom();
+        return;
+      }
+      if (state.selectedIds.size > 0 && state.selectedIds.has(img.image_id)) {
+        state.activeIndex = idx;
+        state.lastSelectedIdx = idx;
+        syncGridSelectionDom();
+        return;
+      }
+      state.selectedIds.clear();
+      updateBatchBar();
       state.activeIndex = idx;
+      state.lastSelectedIdx = idx;
+      syncGridSelectionDom();
       // Always open a newly selected image from the gallery in Fit (zoomed out)
       state.zoomMode = "fit";
       state.zoomScale = 1.0;
@@ -813,6 +884,45 @@
     });
 
     return card;
+  }
+
+  function selectGridRange(targetIdx, preserveMain = true) {
+    const anchor = state.lastSelectedIdx >= 0 ? state.lastSelectedIdx : Math.max(0, state.activeIndex);
+    const lo = Math.max(0, Math.min(anchor, targetIdx));
+    const hi = Math.min(state.items.length - 1, Math.max(anchor, targetIdx));
+    for (let i = lo; i <= hi; i++) {
+      if (state.items[i]) state.selectedIds.add(state.items[i].image_id);
+    }
+    if (!preserveMain || state.activeIndex < 0 || state.activeIndex >= state.items.length) {
+      state.activeIndex = targetIdx;
+    }
+    state.lastSelectedIdx = targetIdx;
+    updateBatchBar();
+    syncGridSelectionDom();
+  }
+
+  function syncGridSelectionDom() {
+    const activeId = state.items[state.activeIndex]?.image_id || "";
+    const hasMulti = state.selectedIds.size > 0;
+    document.querySelectorAll(".photo-card").forEach((c) => {
+      const id = c.dataset.id;
+      const isSel = state.selectedIds.has(id);
+      c.classList.toggle("selected", isSel);
+      c.classList.toggle("main-selected", hasMulti && id === activeId);
+      const chk = c.querySelector(".card-chk");
+      if (chk) chk.checked = isSel;
+    });
+    document.querySelectorAll("#filmstripScroll .fs-item").forEach((fs) => {
+      fs.classList.toggle("fs-multi-selected", state.selectedIds.has(fs.dataset.id));
+    });
+  }
+
+  function getTargetSelectionIds(mainImg, isWvc = false) {
+    const set = isWvc ? state.wvcSelectedIds : state.selectedIds;
+    if (!set || set.size === 0) return mainImg ? [mainImg.image_id] : [];
+    const ids = new Set(set);
+    if (mainImg && mainImg.image_id) ids.add(mainImg.image_id);
+    return Array.from(ids);
   }
 
   function getDisplayLayerForImage(img) {
@@ -853,6 +963,15 @@
       if (pill) {
         pill.className = `card-layer-pill pill-${dispLayer}`;
         pill.textContent = layerLbl;
+      }
+      const thumbWrap = card.querySelector(".card-thumb-wrap");
+      if (thumbWrap) {
+        thumbWrap.querySelectorAll(".card-crop-rect, .card-crop-badge").forEach((n) => n.remove());
+        const cropHtml = renderCardCropOverlayHtml(img);
+        if (cropHtml) {
+          const imgNode = thumbWrap.querySelector(".card-thumb");
+          if (imgNode) imgNode.insertAdjacentHTML("afterend", cropHtml);
+        }
       }
     }
 
@@ -1067,6 +1186,10 @@
     // Right Inspector
     $("inspCropImg").src = `/api/media/crop/${encodeURIComponent(img.image_id)}`;
     renderInspector(img);
+    state.cropDraft = null;
+    state.cropHoverHorizonIdx = null;
+    renderLoupeCropPanel(img);
+    positionLoupeCropBox();
 
     // Always fetch image detail (pulls burst siblings + on-the-fly Canon AF focus points!)
     $("fsPosition").textContent = `${state.activeIndex + 1} / ${state.total}`;
@@ -1075,11 +1198,15 @@
       .then((res) => {
         if (res.image) {
           img.af_points = res.image.af_points || [];
+          img.crop = res.image.crop ?? img.crop ?? null;
+          img.crop_applied = !!res.image.crop_applied;
         }
         state.burstSiblings = res.burst_siblings && res.burst_siblings.length ? res.burst_siblings : [img];
         $("fsBurstCount").textContent = String(state.burstSiblings.length);
         // Only redraw if user is still viewing this same image
         if (state.items[state.activeIndex]?.image_id === reqImageId) {
+          renderLoupeCropPanel(img);
+          positionLoupeCropBox();
           drawLoupeOverlay(img);
           renderFilmstrip();
         }
@@ -1403,10 +1530,18 @@
     wrap.style.transform = `translate(${tx.toFixed(1)}px, ${ty.toFixed(1)}px) scale(${state.zoomScale.toFixed(4)})`;
   }
 
-  function computeGentleHighlightMask(el, cacheKey) {
+  function computeGentleHighlightMask(el, cacheKey, updateLoupeBtn = true) {
     if (!el || !el.naturalWidth || !el.naturalHeight) return null;
-    if (state.highlightMaskKey === cacheKey && state.highlightMaskCanvas) {
-      return state.highlightMaskCanvas;
+    if (state.highlightMaskCache.has(cacheKey)) {
+      const cached = state.highlightMaskCache.get(cacheKey);
+      if (updateLoupeBtn) {
+        const btn = $("btnToggleHighlights");
+        if (btn) {
+          const pctStr = cached.clipPct >= 0.05 ? ` ${cached.clipPct.toFixed(1)}%` : "";
+          btn.textContent = `☀ Highlights${pctStr} (H)`;
+        }
+      }
+      return cached.canvas;
     }
     try {
       const maxDim = 900;
@@ -1443,19 +1578,82 @@
         }
       }
       octx.putImageData(out, 0, 0);
+      const clipPct = (clipped / Math.max(1, total)) * 100;
       state.highlightMaskCanvas = off;
       state.highlightMaskKey = cacheKey;
-      state.highlightClipPct = (clipped / Math.max(1, total)) * 100;
+      state.highlightClipPct = clipPct;
+      state.highlightMaskCache.set(cacheKey, { canvas: off, clipPct });
+      if (state.highlightMaskCache.size > 16) {
+        const oldestKey = state.highlightMaskCache.keys().next().value;
+        state.highlightMaskCache.delete(oldestKey);
+      }
 
-      const btn = $("btnToggleHighlights");
-      if (btn) {
-        const pctStr = state.highlightClipPct >= 0.05 ? ` ${state.highlightClipPct.toFixed(1)}%` : "";
-        btn.textContent = `☀ Highlights${pctStr} (H)`;
+      if (updateLoupeBtn) {
+        const btn = $("btnToggleHighlights");
+        if (btn) {
+          const pctStr = clipPct >= 0.05 ? ` ${clipPct.toFixed(1)}%` : "";
+          btn.textContent = `☀ Highlights${pctStr} (H)`;
+        }
       }
       return off;
     } catch (_) {
       return null;
     }
+  }
+
+  function drawWvcPaneOverlay(canvas, el, img) {
+    if (!canvas || !el || !img) return;
+    const w = el.offsetWidth || el.clientWidth;
+    const h = el.offsetHeight || el.clientHeight;
+    if (!w || !h) return;
+    const dpr = Math.min(3, Math.max(2, window.devicePixelRatio || 1));
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    if (state.showHighlights && el.complete && el.naturalWidth > 0) {
+      const mask = computeGentleHighlightMask(el, img.image_id, false);
+      if (mask) ctx.drawImage(mask, 0, 0, w, h);
+    }
+
+    if (state.showAfPoints && Array.isArray(img.af_points) && img.af_points.length > 0) {
+      for (const box of img.af_points) {
+        const bx = box.x * w;
+        const by = box.y * h;
+        const bw = box.w * w;
+        const bh = box.h * h;
+        if (box.in_focus) {
+          ctx.strokeStyle = "#ef4444";
+          ctx.fillStyle = "rgba(239, 68, 68, 0.14)";
+          ctx.lineWidth = 2.0;
+          ctx.fillRect(bx, by, bw, bh);
+          ctx.strokeRect(bx, by, bw, bh);
+          const cx = bx + bw * 0.5;
+          const cy = by + bh * 0.5;
+          const tick = Math.min(bw, bh) * 0.25;
+          ctx.beginPath();
+          ctx.moveTo(cx - tick, cy); ctx.lineTo(cx + tick, cy);
+          ctx.moveTo(cx, cy - tick); ctx.lineTo(cx, cy + tick);
+          ctx.stroke();
+        } else {
+          ctx.strokeStyle = "rgba(239, 68, 68, 0.45)";
+          ctx.lineWidth = 1.2;
+          ctx.strokeRect(bx, by, bw, bh);
+        }
+      }
+    }
+  }
+
+  function drawWvcOverlays() {
+    if (state.view !== "compare") return;
+    const win = state.wvcFrames[state.wvcWinnerIdx];
+    const chal = state.wvcFrames[state.wvcChalIdx];
+    $("btnWvcToggleAf")?.classList.toggle("active", state.showAfPoints);
+    $("btnWvcToggleHighlights")?.classList.toggle("active", state.showHighlights);
+    if (win) drawWvcPaneOverlay($("wvcWinOverlay"), $("wvcWinImg"), win);
+    if (chal) drawWvcPaneOverlay($("wvcChalOverlay"), $("wvcChalImg"), chal);
   }
 
   function drawLoupeOverlay(img) {
@@ -1533,6 +1731,414 @@
         ctx.setLineDash([]);
       }
     }
+
+    // 3. Smart Straighten & Crop preview (when NOT in DOM edit mode) + Detected Horizon Guide Line
+    const activeCrop = (state.cropEditMode && state.cropDraft) ? state.cropDraft : img.crop;
+    if (activeCrop) {
+      const horizons = Array.isArray(activeCrop.horizons) ? activeCrop.horizons : [];
+      const hIdx = state.cropHoverHorizonIdx !== null
+        ? state.cropHoverHorizonIdx
+        : (state.cropEditMode ? activeCrop.selected_horizon_idx : null);
+      if (hIdx !== null && hIdx !== undefined && hIdx >= 0) {
+        const hz = horizons.find((item) => item.id === hIdx) || horizons[hIdx];
+        if (hz) {
+          ctx.save();
+          ctx.strokeStyle = "#38bdf8";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([7, 5]);
+          ctx.beginPath();
+          ctx.moveTo((hz.x1 ?? 0) * w, (hz.y1 ?? hz.y_norm ?? 0.5) * h);
+          ctx.lineTo((hz.x2 ?? 1) * w, (hz.y2 ?? hz.y_norm ?? 0.5) * h);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.restore();
+        }
+      }
+
+      if (!state.cropEditMode && hasVisibleCrop(activeCrop)) {
+        const cx = ((activeCrop.left + activeCrop.right) * 0.5) * w;
+        const cy = ((activeCrop.top + activeCrop.bottom) * 0.5) * h;
+        const rw = (activeCrop.right - activeCrop.left) * w;
+        const rh = (activeCrop.bottom - activeCrop.top) * h;
+        const rad = ((activeCrop.angle || 0) * Math.PI) / 180;
+        const applied = !!(activeCrop.applied || img.crop_applied);
+
+        ctx.save();
+        if (applied) {
+          // Dim outside area using even-odd clip path around the rotated crop rect
+          ctx.fillStyle = "rgba(0, 0, 0, 0.48)";
+          ctx.beginPath();
+          ctx.rect(0, 0, w, h);
+          ctx.translate(cx, cy);
+          ctx.rotate(rad);
+          ctx.rect(-rw / 2, -rh / 2, rw, rh);
+          ctx.fill("evenodd");
+          ctx.strokeStyle = "#facc15";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(-rw / 2, -rh / 2, rw, rh);
+        } else {
+          // Suggested (unapplied) crop preview: faint gray dashed border
+          ctx.translate(cx, cy);
+          ctx.rotate(rad);
+          ctx.strokeStyle = "rgba(200, 210, 225, 0.68)";
+          ctx.lineWidth = 1.6;
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(-rw / 2, -rh / 2, rw, rh);
+          ctx.setLineDash([]);
+        }
+        ctx.restore();
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Auto Smart Straighten & Smart Crop Controller
+  // ------------------------------------------------------------------
+  function getOrigDimsForCrop(img, crop) {
+    const el = $("loupeImg");
+    const ow = Number(crop?.orig_width || img?.width || el?.naturalWidth || 6000);
+    const oh = Number(crop?.orig_height || img?.height || el?.naturalHeight || 4000);
+    return { ow: Math.max(1, ow), oh: Math.max(1, oh) };
+  }
+
+  function ensureCropDraft(img) {
+    if (!img) return null;
+    if (state.cropDraft && state.cropDraft._imageId === img.image_id) return state.cropDraft;
+    const base = img.crop || {};
+    const { ow, oh } = getOrigDimsForCrop(img, base);
+    state.cropDraft = {
+      _imageId: img.image_id,
+      left: Number(base.left ?? 0),
+      top: Number(base.top ?? 0),
+      right: Number(base.right ?? 1),
+      bottom: Number(base.bottom ?? 1),
+      angle: Number(base.angle ?? 0),
+      aspect_locked: base.aspect_locked !== undefined ? !!base.aspect_locked : true,
+      aspect_ratio: Number(base.aspect_ratio || (ow / oh)),
+      orig_width: ow,
+      orig_height: oh,
+      min_long_px: Number(base.min_long_px || 2700),
+      selected_horizon_idx: base.selected_horizon_idx ?? null,
+      horizons: Array.isArray(base.horizons) ? base.horizons : [],
+      source: base.source || "manual",
+      applied: !!(base.applied || img.crop_applied),
+    };
+    return state.cropDraft;
+  }
+
+  function updateCropSizeReadout(img, c) {
+    const sizeEl = $("cropSizeReadout");
+    const clampEl = $("cropMinClampBadge");
+    if (!sizeEl) return;
+    if (!c) {
+      const { ow, oh } = getOrigDimsForCrop(img, null);
+      sizeEl.textContent = `${Math.round(ow)} × ${Math.round(oh)} px (Full)`;
+      if (clampEl) clampEl.classList.add("hidden");
+      return;
+    }
+    const { ow, oh } = getOrigDimsForCrop(img, c);
+    const wPx = Math.round(Math.max(0, (c.right - c.left) * ow));
+    const hPx = Math.round(Math.max(0, (c.bottom - c.top) * oh));
+    const minLong = Number(c.min_long_px || 2700);
+    const isFull = !hasVisibleCrop(c);
+    sizeEl.textContent = `${wPx.toLocaleString()} × ${hPx.toLocaleString()} px${isFull ? " (Full)" : ""}`;
+    if (clampEl) {
+      const clamped = !isFull && Math.max(ow, oh) > minLong && Math.max(wPx, hPx) <= minLong + 3;
+      clampEl.classList.toggle("hidden", !clamped);
+    }
+  }
+
+  function renderLoupeCropPanel(img) {
+    if (!img) return;
+    const c = (state.cropEditMode && state.cropDraft && state.cropDraft._imageId === img.image_id)
+      ? state.cropDraft
+      : img.crop;
+
+    const badge = $("cropStatusBadge");
+    if (badge) {
+      badge.className = "crop-status-pill";
+      if (c && (c.applied || img.crop_applied)) {
+        badge.textContent = "Applied ✓";
+        badge.classList.add("applied");
+      } else if (c && hasVisibleCrop(c)) {
+        badge.textContent = "Suggested";
+        badge.classList.add("suggested");
+      } else {
+        badge.textContent = "None";
+      }
+    }
+
+    $("btnToggleCropEdit")?.classList.toggle("active", state.cropEditMode);
+    $("btnCropEditBtn")?.classList.toggle("active", state.cropEditMode);
+
+    updateCropSizeReadout(img, c);
+    const ruleEl = $("cropRuleBadge");
+    if (ruleEl) {
+      const ruleTxt = c && c.composition_rule ? String(c.composition_rule) : "";
+      ruleEl.textContent = ruleTxt;
+      ruleEl.title = ruleTxt ? `Composition: ${ruleTxt}` : "";
+      ruleEl.classList.toggle("hidden", !ruleTxt);
+    }
+
+    const ang = Number(c?.angle ?? 0);
+    if ($("cropAngleSlider")) $("cropAngleSlider").value = String(ang.toFixed(1));
+    if ($("cropAngleInput")) $("cropAngleInput").value = ang.toFixed(1);
+
+    const locked = c ? (c.aspect_locked !== undefined ? !!c.aspect_locked : true) : true;
+    const lockBtn = $("btnCropLockRatio");
+    if (lockBtn) {
+      lockBtn.classList.toggle("active", locked);
+      lockBtn.textContent = locked ? "🔒 Locked" : "🔓 Free";
+    }
+
+    // Highlight matching ratio preset
+    const { ow, oh } = getOrigDimsForCrop(img, c);
+    const origRatio = ow / oh;
+    const curRatio = Number(c?.aspect_ratio || origRatio);
+    document.querySelectorAll("#cropRatioPresets .crp-btn").forEach((b) => {
+      const target = b.dataset.ratio === "orig" ? origRatio : Number(b.dataset.ratio);
+      b.classList.toggle("active", locked && Math.abs(curRatio - target) < 0.03);
+    });
+
+    // Detected Horizons selector
+    const hzWrap = $("cropHorizonsWrap");
+    const hzList = $("cropHorizonsList");
+    const horizons = Array.isArray(c?.horizons) ? c.horizons : [];
+    if (hzWrap && hzList) {
+      if (horizons.length > 0) {
+        hzWrap.classList.remove("hidden");
+        hzList.innerHTML = "";
+        const selIdx = c?.selected_horizon_idx;
+        const noneBtn = document.createElement("button");
+        noneBtn.className = "horizon-pill" + ((selIdx === null || selIdx === undefined || selIdx < 0) && Math.abs(ang) < 0.05 ? " active" : "");
+        noneBtn.textContent = "0.0° Level / None";
+        noneBtn.onclick = () => selectCropHorizon(img, -1, 0.0);
+        hzList.appendChild(noneBtn);
+
+        horizons.forEach((hz, i) => {
+          const hid = hz.id !== undefined ? hz.id : i;
+          const b = document.createElement("button");
+          b.className = "horizon-pill" + (selIdx === hid ? " active" : "");
+          b.textContent = hz.label || `Horizon ${i + 1} (${Number(hz.angle || 0).toFixed(1)}°)`;
+          b.title = `Confidence: ${Math.round((hz.confidence || 0) * 100)}% · Click to align to this horizon`;
+          b.onmouseenter = () => { state.cropHoverHorizonIdx = hid; drawLoupeOverlay(img); };
+          b.onmouseleave = () => { state.cropHoverHorizonIdx = null; drawLoupeOverlay(img); };
+          b.onclick = () => selectCropHorizon(img, hid, Number(hz.angle || 0));
+          hzList.appendChild(b);
+        });
+      } else {
+        hzWrap.classList.add("hidden");
+      }
+    }
+  }
+
+  function positionLoupeCropBox() {
+    const layer = $("loupeCropLayer");
+    const box = $("loupeCropBox");
+    const img = state.items[state.activeIndex];
+    if (!layer || !box) return;
+    if (!state.cropEditMode || state.view !== "loupe" || !img) {
+      layer.classList.add("hidden");
+      return;
+    }
+    const c = ensureCropDraft(img);
+    layer.classList.remove("hidden");
+    box.classList.toggle("suggested", !c.applied);
+    box.style.left = `${(c.left * 100).toFixed(3)}%`;
+    box.style.top = `${(c.top * 100).toFixed(3)}%`;
+    box.style.width = `${((c.right - c.left) * 100).toFixed(3)}%`;
+    box.style.height = `${((c.bottom - c.top) * 100).toFixed(3)}%`;
+    box.style.transform = `rotate(${Number(c.angle || 0).toFixed(2)}deg)`;
+  }
+
+  async function setCropEditMode(enabled) {
+    const img = state.items[state.activeIndex];
+    state.cropEditMode = !!enabled;
+    if (state.cropEditMode && img) {
+      if (state.zoomScale > 1.01) setZoomPreset("fit");
+      if (!img.crop) {
+        await runSmartCropAuto(img, false, false);
+      }
+      ensureCropDraft(img);
+    } else {
+      state.cropHoverHorizonIdx = null;
+    }
+    if (img) {
+      renderLoupeCropPanel(img);
+      positionLoupeCropBox();
+      drawLoupeOverlay(img);
+    }
+  }
+
+  function applyCropResponseToState(res) {
+    if (!res || !res.image) return null;
+    const updated = res.image;
+    const item = state.items.find((x) => x.image_id === updated.image_id);
+    if (item) {
+      Object.assign(item, updated);
+      refreshCardInDom(item);
+    }
+    const wvcItem = state.wvcFrames.find((x) => x.image_id === updated.image_id);
+    if (wvcItem) Object.assign(wvcItem, updated);
+    const active = state.items[state.activeIndex];
+    if (active && active.image_id === updated.image_id) {
+      state.cropDraft = null;
+      if (state.cropEditMode) ensureCropDraft(active);
+      renderLoupeCropPanel(active);
+      positionLoupeCropBox();
+      drawLoupeOverlay(active);
+    }
+    return item || updated;
+  }
+
+  async function runSmartCropAuto(img, applyNow = false, force = false) {
+    if (!img) return;
+    toast(applyNow ? "Calculating & applying Smart Crop..." : "Calculating Smart Straighten & Crop...", 1400);
+    try {
+      const res = await api(`/api/images/${encodeURIComponent(img.image_id)}/smart-crop`, {
+        method: "POST",
+        body: JSON.stringify({ apply: !!applyNow, force: !!force, min_long_px: 2700 }),
+      });
+      applyCropResponseToState(res);
+      if (res.crop) {
+        const w = Math.round(res.crop.crop_width_px || 0);
+        const h = Math.round(res.crop.crop_height_px || 0);
+        const ang = Number(res.crop.angle || 0).toFixed(1);
+        toast(`${applyNow ? "Applied" : "Suggested"} crop: ${w}×${h} px (${ang}°)`, 2000);
+      }
+    } catch (err) {
+      toast("Smart Crop error: " + err.message, 3500);
+    }
+  }
+
+  async function saveCropDraft(img, overrideApplied = null) {
+    if (!img) return;
+    const d = ensureCropDraft(img);
+    const applied = overrideApplied !== null ? !!overrideApplied : !!d.applied;
+    d.applied = applied;
+    try {
+      const res = await api(`/api/images/${encodeURIComponent(img.image_id)}/crop`, {
+        method: "PUT",
+        body: JSON.stringify({
+          left: d.left,
+          top: d.top,
+          right: d.right,
+          bottom: d.bottom,
+          angle: d.angle,
+          aspect_locked: d.aspect_locked,
+          aspect_ratio: d.aspect_ratio,
+          selected_horizon_idx: d.selected_horizon_idx,
+          applied,
+        }),
+      });
+      applyCropResponseToState(res);
+      if (overrideApplied === true) {
+        toast(`Crop applied${res.xmp_synced ? " & synced to XMP ✓" : " ✓"}`, 1800);
+      }
+    } catch (err) {
+      toast("Save crop failed: " + err.message, 3500);
+    }
+  }
+
+  async function selectCropHorizon(img, horizonIdx, angleDeg) {
+    const d = ensureCropDraft(img);
+    d.selected_horizon_idx = horizonIdx >= 0 ? horizonIdx : null;
+    d.angle = Number(angleDeg || 0);
+    renderLoupeCropPanel(img);
+    positionLoupeCropBox();
+    drawLoupeOverlay(img);
+    await saveCropDraft(img, null);
+  }
+
+  async function resetCropForImage(img, mode = "clear") {
+    if (!img) return;
+    try {
+      const res = await api(`/api/images/${encodeURIComponent(img.image_id)}/crop/reset`, {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      });
+      applyCropResponseToState(res);
+      toast(mode === "auto" ? "Recomputed Auto Smart Crop" : "Crop & straighten reset to full frame", 1600);
+    } catch (err) {
+      toast("Reset crop failed: " + err.message, 3500);
+    }
+  }
+
+  async function batchSmartCrop(reset = false) {
+    const ids = Array.from(state.selectedIds);
+    if (!ids.length) return;
+    toast(reset ? `Resetting crop on ${ids.length} images...` : `Smart cropping ${ids.length} images...`, 2000);
+    try {
+      const res = await api("/api/images/batch-smart-crop", {
+        method: "POST",
+        body: JSON.stringify({ image_ids: ids, apply: !reset, reset: !!reset, force: false }),
+      });
+      const updatedList = res.images || [];
+      for (const u of updatedList) {
+        const item = state.items.find((x) => x.image_id === u.image_id);
+        if (item) {
+          Object.assign(item, u);
+          refreshCardInDom(item);
+        }
+      }
+      toast(reset ? `Reset crop on ${res.updated || ids.length} images` : `Applied Smart Crop to ${res.updated || ids.length} images`, 2600);
+    } catch (err) {
+      toast("Batch Smart Crop error: " + err.message, 4000);
+    }
+  }
+
+  async function handleSmartCropReadyWs(imageIds) {
+    if (!Array.isArray(imageIds) || !imageIds.length) return;
+    const idSet = new Set(imageIds);
+    const affected = state.items.filter((x) => idSet.has(x.image_id));
+    if (!affected.length) return;
+    // Refresh up to 24 visible/loaded items smoothly in place without jarring full reload
+    for (const item of affected.slice(0, 24)) {
+      try {
+        const res = await api(`/api/images/${encodeURIComponent(item.image_id)}`);
+        if (res.image) {
+          item.crop = res.image.crop ?? null;
+          item.crop_applied = !!res.image.crop_applied;
+          refreshCardInDom(item);
+          if (state.view === "loupe" && state.items[state.activeIndex]?.image_id === item.image_id) {
+            renderLoupeCropPanel(item);
+            positionLoupeCropBox();
+            drawLoupeOverlay(item);
+          }
+        }
+      } catch (_) {}
+    }
+  }
+
+  function applyCropRatioPreset(img, ratioStr) {
+    const d = ensureCropDraft(img);
+    const { ow, oh } = getOrigDimsForCrop(img, d);
+    const targetRatio = ratioStr === "orig" ? (ow / oh) : Number(ratioStr);
+    if (!targetRatio || targetRatio <= 0) return;
+    d.aspect_locked = true;
+    d.aspect_ratio = targetRatio;
+    // Re-fit box around current center preserving normalized area
+    const cx = (d.left + d.right) * 0.5;
+    const cy = (d.top + d.bottom) * 0.5;
+    const normRatio = targetRatio / (ow / oh); // (w_norm / h_norm)
+    let nw = d.right - d.left;
+    let nh = nw / normRatio;
+    if (nh > 1) { nh = 1; nw = nh * normRatio; }
+    if (nw > 1) { nw = 1; nh = nw / normRatio; }
+    let l = cx - nw / 2;
+    let t = cy - nh / 2;
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (l + nw > 1) l = 1 - nw;
+    if (t + nh > 1) t = 1 - nh;
+    d.left = Math.max(0, l);
+    d.top = Math.max(0, t);
+    d.right = Math.min(1, l + nw);
+    d.bottom = Math.min(1, t + nh);
+    renderLoupeCropPanel(img);
+    positionLoupeCropBox();
+    drawLoupeOverlay(img);
+    saveCropDraft(img, null);
   }
 
   function renderLoupeControls(img) {
@@ -1543,7 +2149,12 @@
       b.className = "star-btn" + (i <= (img.effective_rating || 0) ? " on" : "");
       b.textContent = "★";
       b.title = `Set ${i} star${i > 1 ? "s" : ""} (Key ${i})`;
-      b.onclick = () => setRating(img, img.effective_rating === i ? 0 : i);
+      b.onclick = () => {
+        const nextR = img.effective_rating === i ? 0 : i;
+        const targets = getTargetSelectionIds(img, false);
+        if (targets.length > 1) batchUpdate({ rating: nextR }, targets);
+        else setRating(img, nextR);
+      };
       starsEl.appendChild(b);
     }
 
@@ -1554,7 +2165,12 @@
       b.className = `cp-dot ${c.css}` + ((img.effective_label || "") === c.key ? " active" : "");
       b.title = `${c.name} (${c.shortcut})`;
       if (!c.key) b.textContent = "∅";
-      b.onclick = () => setColorLabel(img, c.key);
+      b.onclick = () => {
+        const nextLbl = c.key ? (img.effective_label === c.key ? "" : c.key) : "";
+        const targets = getTargetSelectionIds(img, false);
+        if (targets.length > 1) batchUpdate({ label: nextLbl }, targets);
+        else setColorLabel(img, nextLbl);
+      };
       colEl.appendChild(b);
     }
 
@@ -1658,22 +2274,45 @@
   function createFilmstripItemEl(item, currentId) {
     const div = document.createElement("div");
     const lblCls = item.effective_label ? ` fs-label-${item.effective_label}` : "";
-    div.className = "fs-item" + lblCls + (item.image_id === currentId ? " active" : "");
+    const multiCls = state.selectedIds.has(item.image_id) ? " fs-multi-selected" : "";
+    div.className = "fs-item" + lblCls + multiCls + (item.image_id === currentId ? " active" : "");
     div.dataset.id = item.image_id;
-    div.title = `${item.filename} · ${item.effective_label || "Unselected"} · Sharp: ${Math.round(item.sharpness_score || 0)}`;
+    div.title = `${item.filename} · ${item.effective_label || "Unselected"} · Sharp: ${Math.round(item.sharpness_score || 0)} (Shift+Click range · Ctrl+Click multi-select)`;
     div.innerHTML = `
       <img loading="lazy" decoding="async" src="/api/media/thumb/${encodeURIComponent(item.image_id)}" alt="" />
       <div class="fs-sharp-bar" style="width:${Math.min(100, item.sharpness_score || 0)}%"></div>
       ${item.effective_rating ? `<span class="fs-star-mini">${"★".repeat(item.effective_rating)}</span>` : ""}
     `;
-    div.onclick = () => {
+    div.onclick = (e) => {
       const idx = state.items.findIndex((x) => x.image_id === item.image_id);
+      if (e.shiftKey && idx >= 0) {
+        e.preventDefault();
+        selectGridRange(idx, true);
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && idx >= 0) {
+        e.preventDefault();
+        if (state.selectedIds.size === 0 && state.items[state.activeIndex]) {
+          state.selectedIds.add(state.items[state.activeIndex].image_id);
+        }
+        toggleSelect(item.image_id, !state.selectedIds.has(item.image_id));
+        state.lastSelectedIdx = idx;
+        syncGridSelectionDom();
+        return;
+      }
+      const keepSelection = state.selectedIds.size > 0 && state.selectedIds.has(item.image_id);
+      if (!keepSelection) {
+        state.selectedIds.clear();
+        updateBatchBar();
+      }
       if (idx >= 0) {
         state.activeIndex = idx;
+        state.lastSelectedIdx = idx;
         renderLoupe();
       } else {
         state.items.splice(state.activeIndex + 1, 0, item);
         state.activeIndex += 1;
+        state.lastSelectedIdx = state.activeIndex;
         renderLoupe();
       }
     };
@@ -2028,6 +2667,8 @@
       state.wvcFrames = frames;
       state.wvcBurstPos = res.burst_pos || 0;
       state.wvcTotalBursts = res.total_bursts || 0;
+      state.wvcPrevBurstId = res.prev_burst_id || "";
+      state.wvcNextBurstId = res.next_burst_id || "";
       state.wvcFirstImgPos = res.first_image_pos || 0;
       state.wvcTotalImgs = res.total_images || 0;
 
@@ -2055,6 +2696,8 @@
         if (fi >= 0) chalIdx = fi;
       }
       state.wvcChalIdx = chalIdx;
+      state.wvcSelectedIds.clear();
+      state.wvcAnchorIdx = chalIdx;
       state.wvcZoomed = false;
       state.wvcScale = 3.2;
       state.wvcPanX = 0;
@@ -2108,14 +2751,28 @@
     container.querySelectorAll("[data-wr]").forEach((b) => {
       b.onclick = async () => {
         const r = Number(b.dataset.wr);
-        await setRating(img, img.effective_rating === r ? 0 : r, false);
-        renderWvc();
+        const nextR = img.effective_rating === r ? 0 : r;
+        const isChalPane = container.id === "wvcChalControls";
+        const targets = isChalPane ? getTargetSelectionIds(img, true) : [img.image_id];
+        if (targets.length > 1) {
+          await batchUpdate({ rating: nextR }, targets);
+        } else {
+          await setRating(img, nextR, false);
+          renderWvc();
+        }
       };
     });
     container.querySelectorAll("[data-wl]").forEach((b) => {
       b.onclick = async () => {
-        await setColorLabel(img, b.dataset.wl, false);
-        renderWvc();
+        const nextLbl = b.dataset.wl ? (img.effective_label === b.dataset.wl ? "" : b.dataset.wl) : "";
+        const isChalPane = container.id === "wvcChalControls";
+        const targets = isChalPane ? getTargetSelectionIds(img, true) : [img.image_id];
+        if (targets.length > 1) {
+          await batchUpdate({ label: nextLbl }, targets);
+        } else {
+          await setColorLabel(img, nextLbl, false);
+          renderWvc();
+        }
       };
     });
   }
@@ -2187,8 +2844,8 @@
     const chalUrl = state.wvcZoomed ? getZoomMediaUrl(chal.image_id) : `/api/media/hq/${encodeURIComponent(chal.image_id)}`;
     const wi = $("wvcWinImg");
     const ci = $("wvcChalImg");
-    wi.onload = () => applyWvcZoomTransforms();
-    ci.onload = () => applyWvcZoomTransforms();
+    wi.onload = () => { applyWvcZoomTransforms(); drawWvcOverlays(); };
+    ci.onload = () => { applyWvcZoomTransforms(); drawWvcOverlays(); };
     applyImageColorFrame(wi, win.effective_label);
     applyImageColorFrame(ci, chal.effective_label);
     if (wi.dataset.loadedUrl !== winUrl) {
@@ -2200,16 +2857,18 @@
       ci.src = chalUrl;
     }
     applyWvcZoomTransforms();
+    drawWvcOverlays();
 
     renderWvcPaneControls($("wvcWinControls"), win);
     renderWvcPaneControls($("wvcChalControls"), chal);
 
-    // Fetch AF points for both frames if missing so synced focus zoom centers on bird eye!
+    // Fetch AF points for both frames if missing so synced focus zoom & AF box overlay work on both panes!
     for (const f of [win, chal]) {
       if (f.af_points === null || f.af_points === undefined) {
         api(`/api/images/${encodeURIComponent(f.image_id)}`).then((r) => {
           if (r.image) f.af_points = r.image.af_points || [];
           if (state.wvcZoomed) applyWvcZoomTransforms();
+          drawWvcOverlays();
         }).catch(() => {});
       }
     }
@@ -2219,7 +2878,10 @@
     if ($("btnWvcChalNext")) $("btnWvcChalNext").classList.toggle("hidden", state.wvcChalIdx >= frames.length - 1);
 
     // Render Color-Coded Burst Filmstrip
-    $("wvcStripPos").textContent = `Frame ${state.wvcChalIdx + 1} / ${frames.length}`;
+    const wvcSelCount = state.wvcSelectedIds.size;
+    $("wvcStripPos").textContent = wvcSelCount > 1
+      ? `Frame ${state.wvcChalIdx + 1} / ${frames.length} · ${wvcSelCount} selected (Esc to clear)`
+      : `Frame ${state.wvcChalIdx + 1} / ${frames.length}`;
     const strip = $("wvcFilmstrip");
     strip.innerHTML = "";
     const frag = document.createDocumentFragment();
@@ -2227,15 +2889,44 @@
       const div = document.createElement("div");
       const lblCls = f.effective_label ? ` fs-label-${f.effective_label}` : "";
       const pinCls = i === state.wvcWinnerIdx ? " fs-pinned" : "";
-      div.className = "fs-item" + lblCls + pinCls + (i === state.wvcChalIdx ? " active" : "");
-      div.title = `${f.filename} · ${f.effective_label || "Unselected"} · Sharp: ${Math.round(f.sharpness_score || 0)}`;
+      const multiCls = state.wvcSelectedIds.has(f.image_id) ? " fs-multi-selected" : "";
+      div.className = "fs-item" + lblCls + pinCls + multiCls + (i === state.wvcChalIdx ? " active" : "");
+      div.dataset.id = f.image_id;
+      div.title = `${f.filename} · ${f.effective_label || "Unselected"} · Sharp: ${Math.round(f.sharpness_score || 0)} (Shift+Click range · Ctrl+Click multi-select)`;
       div.innerHTML = `
         <img loading="lazy" decoding="async" src="/api/media/thumb/${encodeURIComponent(f.image_id)}" alt="" />
         <div class="fs-sharp-bar" style="width:${Math.min(100, f.sharpness_score || 0)}%"></div>
         ${f.effective_rating ? `<span class="fs-star-mini">${"★".repeat(f.effective_rating)}</span>` : ""}
       `;
-      div.onclick = () => {
+      div.onclick = (e) => {
+        if (e.shiftKey) {
+          e.preventDefault();
+          const anchor = state.wvcAnchorIdx >= 0 ? state.wvcAnchorIdx : state.wvcChalIdx;
+          const lo = Math.max(0, Math.min(anchor, i));
+          const hi = Math.min(frames.length - 1, Math.max(anchor, i));
+          for (let k = lo; k <= hi; k++) {
+            state.wvcSelectedIds.add(frames[k].image_id);
+          }
+          state.wvcAnchorIdx = i;
+          renderWvc();
+          return;
+        }
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault();
+          if (state.wvcSelectedIds.size === 0 && frames[state.wvcChalIdx]) {
+            state.wvcSelectedIds.add(frames[state.wvcChalIdx].image_id);
+          }
+          if (state.wvcSelectedIds.has(f.image_id)) state.wvcSelectedIds.delete(f.image_id);
+          else state.wvcSelectedIds.add(f.image_id);
+          state.wvcAnchorIdx = i;
+          renderWvc();
+          return;
+        }
+        if (!(state.wvcSelectedIds.size > 0 && state.wvcSelectedIds.has(f.image_id))) {
+          state.wvcSelectedIds.clear();
+        }
         state.wvcChalIdx = i;
+        state.wvcAnchorIdx = i;
         renderWvc();
       };
       frag.appendChild(div);
@@ -2279,21 +2970,324 @@
   }
 
   async function wvcStepBurst(delta) {
-    if (!state.bursts.length) {
-      await loadBursts(true);
-    }
+    // If current burst is in the loaded burst list (e.g. from Burst Rows with filters/sort), step within that list
     let idx = state.bursts.findIndex((b) => b.burst_id === state.wvcBurstId);
-    if (idx < 0) idx = state.activeBurstIdx;
-    const nextIdx = idx + delta;
-    if (nextIdx < 0 || nextIdx >= state.bursts.length) {
-      toast(delta > 0 ? "Reached last loaded burst" : "Already at first burst");
+    if (idx >= 0) {
+      const nextIdx = idx + delta;
+      if (nextIdx >= state.bursts.length && state.bursts.length < state.burstsTotal) {
+        await loadBursts(false);
+      }
+      if (nextIdx < 0 || nextIdx >= state.bursts.length) {
+        toast(delta > 0 ? "Reached last burst" : "Already at first burst");
+        return;
+      }
+      state.activeBurstIdx = nextIdx;
+      if (nextIdx >= state.bursts.length - 5 && state.bursts.length < state.burstsTotal) {
+        loadBursts(false);
+      }
+      await loadWvcBurst(state.bursts[nextIdx].burst_id);
       return;
     }
-    state.activeBurstIdx = nextIdx;
-    if (nextIdx >= state.bursts.length - 5 && state.bursts.length < state.burstsTotal) {
-      loadBursts(false);
+
+    // Otherwise (e.g. right after a page refresh deep in the shoot), use exact server-provided prev/next burst IDs!
+    const targetBurstId = delta > 0 ? state.wvcNextBurstId : state.wvcPrevBurstId;
+    if (!targetBurstId) {
+      toast(delta > 0 ? "Reached last burst" : "Already at first burst");
+      return;
     }
-    await loadWvcBurst(state.bursts[nextIdx].burst_id);
+    await loadWvcBurst(targetBurstId);
+  }
+
+  // ------------------------------------------------------------------
+  // Editable Jump-to-Position Counters & Persistent Bookmarks
+  // ------------------------------------------------------------------
+  function openInlineJumpEditor(chipEl, currentVal, maxVal, prefixLabel, onJump) {
+    if (!chipEl || chipEl.querySelector("input")) return;
+    const origText = chipEl.textContent;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = "jump-inline-input";
+    input.min = "1";
+    if (maxVal > 0) input.max = String(maxVal);
+    input.value = String(Math.max(1, currentVal || 1));
+
+    let finished = false;
+    const cancel = () => {
+      if (finished) return;
+      finished = true;
+      chipEl.textContent = origText;
+    };
+    const commit = async () => {
+      if (finished) return;
+      finished = true;
+      const n = parseInt(input.value, 10);
+      chipEl.textContent = origText;
+      if (!Number.isFinite(n) || n < 1) return;
+      const target = maxVal > 0 ? Math.max(1, Math.min(maxVal, n)) : n;
+      await onJump(target);
+    };
+
+    chipEl.textContent = "";
+    if (prefixLabel) {
+      const sp = document.createElement("span");
+      sp.textContent = prefixLabel + " ";
+      chipEl.appendChild(sp);
+    }
+    chipEl.appendChild(input);
+    if (maxVal > 0) {
+      const sp2 = document.createElement("span");
+      sp2.textContent = ` / ${maxVal.toLocaleString()}`;
+      chipEl.appendChild(sp2);
+    }
+    input.focus();
+    input.select();
+
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commit();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancel();
+      }
+    });
+    input.addEventListener("blur", () => cancel());
+  }
+
+  async function jumpToBurstPosition(pos) {
+    if (!state.currentDirId) return;
+    // If Burst Rows list is already loaded and covers `pos`, use it so active burst filter/sort is honored
+    if (state.bursts.length >= pos && state.bursts[pos - 1]) {
+      state.activeBurstIdx = pos - 1;
+      await loadWvcBurst(state.bursts[pos - 1].burst_id);
+      return;
+    }
+    try {
+      const sub = state.filters.subfolder === "__all__" ? "" : (state.filters.subfolder || "");
+      const q = sub ? `&subfolder=${encodeURIComponent(sub)}` : "";
+      const res = await api(`/api/bursts/${state.currentDirId}/at-position?pos=${encodeURIComponent(pos)}${q}`);
+      if (res.burst_id) {
+        await loadWvcBurst(res.burst_id);
+        toast(`Jumped to Burst ${res.pos} / ${res.total_bursts}`, 1400);
+      }
+    } catch (err) {
+      toast("Jump to burst failed: " + err.message, 3000);
+    }
+  }
+
+  async function jumpToImagePositionInWvc(pos) {
+    if (!state.currentDirId) return;
+    const chal = state.wvcFrames[state.wvcChalIdx];
+    const inFiltered = chal && state.items.some((it) => it.image_id === chal.image_id);
+    if (inFiltered && pos <= state.items.length && state.items[pos - 1]?.burst_id) {
+      const target = state.items[pos - 1];
+      await loadWvcBurst(target.burst_id, target.image_id);
+      toast(`Jumped to Image ${pos.toLocaleString()} (${target.filename})`, 1400);
+      return;
+    }
+    try {
+      const sub = state.filters.subfolder === "__all__" ? "" : (state.filters.subfolder || "");
+      const q = sub ? `&subfolder=${encodeURIComponent(sub)}` : "";
+      const res = await api(`/api/images/${state.currentDirId}/at-position?pos=${encodeURIComponent(pos)}${q}`);
+      if (res.burst_id) {
+        await loadWvcBurst(res.burst_id, res.image_id);
+        toast(`Jumped to Image ${res.pos.toLocaleString()} (${res.filename})`, 1400);
+      } else {
+        toast("That image is not assigned to a burst yet.", 2500);
+      }
+    } catch (err) {
+      toast("Jump to image failed: " + err.message, 3000);
+    }
+  }
+
+  async function jumpToImagePositionInLoupe(pos) {
+    const tot = state.total || state.items.length;
+    if (!tot) return;
+    const targetIdx = Math.max(0, Math.min(tot - 1, pos - 1));
+    while (state.items.length <= targetIdx && state.items.length < state.total) {
+      await loadImages(false);
+    }
+    if (targetIdx < state.items.length) {
+      state.activeIndex = targetIdx;
+      renderLoupe();
+      toast(`Jumped to Image ${(targetIdx + 1).toLocaleString()} / ${tot.toLocaleString()}`, 1400);
+    }
+  }
+
+  async function loadBookmarks(dirId) {
+    if (!dirId) return;
+    try {
+      const res = await api(`/api/bookmarks?dir_id=${encodeURIComponent(dirId)}`);
+      state.bookmarks = res.bookmarks || [];
+      renderBookmarksList();
+    } catch (_) {}
+  }
+
+  function renderBookmarksList() {
+    const badge = $("bookmarkCountBadge");
+    if (badge) {
+      badge.textContent = String(state.bookmarks.length);
+      badge.classList.toggle("hidden", state.bookmarks.length === 0);
+    }
+    const list = $("bookmarksList");
+    if (!list) return;
+    if (!state.bookmarks.length) {
+      list.innerHTML = `<div class="bm-empty muted">No bookmarks yet. Click "+ Bookmark Here" to save your spot!</div>`;
+      return;
+    }
+    list.innerHTML = "";
+    const viewNames = { compare: "Winner vs", loupe: "Loupe", grid: "Grid", bursts: "Bursts" };
+    for (const bm of state.bookmarks) {
+      const row = document.createElement("div");
+      row.className = "bm-item";
+      const vCls = `v-${bm.view || "compare"}`;
+      const vLabel = viewNames[bm.view] || bm.view;
+      const titleParts = [];
+      if (bm.label) titleParts.push(bm.label);
+      else if (bm.view === "compare" && bm.burst_pos) titleParts.push(`Burst ${bm.burst_pos}`);
+      else if (bm.filename) titleParts.push(bm.filename);
+      else titleParts.push(vLabel);
+
+      const subParts = [];
+      if (bm.burst_id) subParts.push(bm.burst_pos ? `Burst ${bm.burst_pos} (${bm.burst_id})` : bm.burst_id);
+      if (bm.image_pos) subParts.push(`Image ${Number(bm.image_pos).toLocaleString()}`);
+      if (bm.filename) subParts.push(bm.filename);
+      if (bm.subfolder) subParts.push(bm.subfolder);
+
+      row.innerHTML = `
+        <div class="bm-item-main">
+          <div class="bm-item-top">
+            <span class="bm-view-pill ${vCls}">${escapeHtml(vLabel)}</span>
+            <span>${escapeHtml(titleParts.join(" · "))}</span>
+          </div>
+          <div class="bm-item-sub">${escapeHtml(subParts.join(" · ") || "Saved position")}</div>
+        </div>
+        <button class="bm-del-btn" title="Delete bookmark">✕</button>
+      `;
+      row.onclick = (e) => {
+        if (e.target.closest(".bm-del-btn")) return;
+        $("bookmarksDropdown")?.classList.add("hidden");
+        jumpToBookmark(bm);
+      };
+      row.querySelector(".bm-del-btn").onclick = (e) => {
+        e.stopPropagation();
+        deleteBookmark(bm.id);
+      };
+      list.appendChild(row);
+    }
+  }
+
+  async function saveCurrentBookmark(customLabel = "") {
+    if (!state.currentDirId) return;
+    const sub = state.filters.subfolder === "__all__" ? "" : (state.filters.subfolder || "");
+    const payload = {
+      dir_id: state.currentDirId,
+      label: (customLabel || "").trim(),
+      view: state.view,
+      subfolder: sub,
+      burst_id: "",
+      winner_id: "",
+      chal_id: "",
+      image_id: "",
+      filename: "",
+      burst_pos: 0,
+      image_pos: 0,
+      scroll_top: Math.round($("gridView")?.scrollTop || 0),
+    };
+    if (state.view === "compare") {
+      const win = state.wvcFrames[state.wvcWinnerIdx];
+      const chal = state.wvcFrames[state.wvcChalIdx];
+      const bIdx = state.bursts.findIndex((b) => b.burst_id === state.wvcBurstId);
+      const filteredIdx = chal ? state.items.findIndex((it) => it.image_id === chal.image_id) : -1;
+      payload.burst_id = state.wvcBurstId || "";
+      payload.winner_id = win?.image_id || "";
+      payload.chal_id = chal?.image_id || "";
+      payload.image_id = chal?.image_id || win?.image_id || "";
+      payload.filename = chal?.filename || win?.filename || "";
+      payload.burst_pos = bIdx >= 0 ? (bIdx + 1) : (state.wvcBurstPos || 0);
+      payload.image_pos = filteredIdx >= 0 ? (filteredIdx + 1) : (state.wvcFirstImgPos ? (state.wvcFirstImgPos + state.wvcChalIdx) : 0);
+    } else if (state.view === "loupe") {
+      const img = state.items[state.activeIndex];
+      payload.image_id = img?.image_id || "";
+      payload.filename = img?.filename || "";
+      payload.burst_id = img?.burst_id || "";
+      payload.image_pos = state.activeIndex + 1;
+    } else if (state.view === "bursts") {
+      const b = state.bursts[state.activeBurstIdx];
+      payload.burst_id = b?.burst_id || "";
+      payload.burst_pos = state.activeBurstIdx + 1;
+    } else {
+      const img = state.items[state.activeIndex];
+      payload.image_id = img?.image_id || "";
+      payload.filename = img?.filename || "";
+      payload.image_pos = state.activeIndex + 1;
+    }
+
+    try {
+      const res = await api("/api/bookmarks", { method: "POST", body: JSON.stringify(payload) });
+      if (res.bookmark) {
+        state.bookmarks.unshift(res.bookmark);
+        renderBookmarksList();
+        toast(`🔖 Bookmarked ${payload.label || payload.filename || payload.burst_id || payload.view}`, 1800);
+      }
+    } catch (err) {
+      toast("Bookmark error: " + err.message, 3000);
+    }
+  }
+
+  async function jumpToBookmark(bm) {
+    if (!bm) return;
+    // Restore subfolder if it differs
+    const targetSub = bm.subfolder || "__all__";
+    if (state.filters.subfolder !== targetSub) {
+      state.filters.subfolder = targetSub;
+      syncFilterControlsFromState();
+      await loadImages(true);
+    }
+    if (bm.view === "compare" && bm.burst_id) {
+      await openWinnerVsChallengerForBurst(bm.burst_id, bm.chal_id || "", bm.winner_id || "");
+      toast(`Jumped to bookmark (${bm.label || bm.filename || bm.burst_id})`, 1600);
+      return;
+    }
+    if (bm.view === "loupe") {
+      if (bm.image_id) {
+        let idx = state.items.findIndex((it) => it.image_id === bm.image_id);
+        while (idx < 0 && state.items.length < state.total) {
+          await loadImages(false);
+          idx = state.items.findIndex((it) => it.image_id === bm.image_id);
+        }
+        if (idx >= 0) state.activeIndex = idx;
+      } else if (bm.image_pos > 0) {
+        await jumpToImagePositionInLoupe(bm.image_pos);
+      }
+      setView("loupe");
+      toast(`Jumped to bookmark (${bm.label || bm.filename || "Loupe"})`, 1600);
+      return;
+    }
+    if (bm.view === "bursts") {
+      setView("bursts");
+      if (bm.burst_pos > 0) {
+        state.activeBurstIdx = Math.max(0, bm.burst_pos - 1);
+      }
+      toast(`Jumped to bookmark (${bm.label || bm.burst_id || "Bursts"})`, 1600);
+      return;
+    }
+    setView("grid");
+    if (bm.scroll_top > 0) {
+      requestAnimationFrame(() => { $("gridView").scrollTop = bm.scroll_top; });
+    }
+    toast(`Jumped to bookmark (${bm.label || bm.filename || "Grid"})`, 1600);
+  }
+
+  async function deleteBookmark(bookmarkId) {
+    try {
+      await api(`/api/bookmarks/${bookmarkId}`, { method: "DELETE" });
+      state.bookmarks = state.bookmarks.filter((b) => b.id !== bookmarkId);
+      renderBookmarksList();
+    } catch (err) {
+      toast("Delete bookmark error: " + err.message, 3000);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -2370,16 +3364,38 @@
     }
   }
 
-  async function batchUpdate(payload) {
-    const ids = Array.from(state.selectedIds);
+  async function batchUpdate(payload, explicitIds = null) {
+    const ids = Array.isArray(explicitIds) && explicitIds.length
+      ? explicitIds
+      : Array.from(state.selectedIds);
     if (!ids.length) return;
+    // Optimistically update in-memory items & DOM immediately
+    const idSet = new Set(ids);
+    for (const arr of [state.items, state.wvcFrames]) {
+      for (const it of arr) {
+        if (!idSet.has(it.image_id)) continue;
+        if (payload.rating !== undefined) it.effective_rating = payload.rating;
+        if (payload.label !== undefined) it.effective_label = payload.label;
+        if (payload.user_flag !== undefined) it.user_flag = payload.user_flag;
+        refreshCardInDom(it);
+      }
+    }
+    if (state.view === "loupe" && state.items[state.activeIndex]) {
+      renderLoupeControls(state.items[state.activeIndex]);
+      renderInspector(state.items[state.activeIndex]);
+    } else if (state.view === "compare") {
+      renderWvc();
+    }
     try {
       const res = await api("/api/images/batch-metadata", {
         method: "POST",
         body: JSON.stringify({ image_ids: ids, ...payload }),
       });
-      toast(`Updated ${res.updated} images (XMP synced: ${res.xmp_synced})`);
-      await loadImages(true);
+      refreshSidebarCounts();
+      const desc = payload.rating !== undefined
+        ? `${payload.rating}★`
+        : (payload.label !== undefined ? (payload.label || "No Color") : "Updated");
+      toast(`${res.updated} images → ${desc}`, 1400);
     } catch (err) {
       toast("Batch update failed: " + err.message);
     }
@@ -2863,7 +3879,63 @@
       e.stopPropagation();
       $("cullDropdown").classList.toggle("hidden");
     };
-    document.addEventListener("click", () => $("cullDropdown").classList.add("hidden"));
+    document.addEventListener("click", (e) => {
+      $("cullDropdown").classList.add("hidden");
+      if (!e.target.closest(".bookmark-menu-wrap")) {
+        $("bookmarksDropdown")?.classList.add("hidden");
+      }
+    });
+    if ($("btnBookmarksMenu")) {
+      $("btnBookmarksMenu").onclick = (e) => {
+        e.stopPropagation();
+        $("bookmarksDropdown")?.classList.toggle("hidden");
+      };
+    }
+    if ($("btnAddBookmark")) {
+      $("btnAddBookmark").onclick = async () => {
+        const inp = $("inputBookmarkLabel");
+        const lbl = inp ? inp.value : "";
+        await saveCurrentBookmark(lbl);
+        if (inp) inp.value = "";
+      };
+    }
+    if ($("inputBookmarkLabel")) {
+      $("inputBookmarkLabel").addEventListener("keydown", async (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const lbl = $("inputBookmarkLabel").value;
+          await saveCurrentBookmark(lbl);
+          $("inputBookmarkLabel").value = "";
+        }
+      });
+    }
+    if ($("btnWvcBookmark")) {
+      $("btnWvcBookmark").onclick = () => saveCurrentBookmark("");
+    }
+    // Editable Jump-to-Position Counters (Burst X/Y & Image X/Y)
+    if ($("compareBurstCounter")) {
+      $("compareBurstCounter").onclick = () => {
+        const bIdx = state.bursts.findIndex((b) => b.burst_id === state.wvcBurstId);
+        const cur = bIdx >= 0 ? (bIdx + 1) : (state.wvcBurstPos || 1);
+        const tot = (bIdx >= 0 && state.burstsTotal > 0) ? state.burstsTotal : (state.wvcTotalBursts || 0);
+        openInlineJumpEditor($("compareBurstCounter"), cur, tot, "Burst", (n) => jumpToBurstPosition(n));
+      };
+    }
+    if ($("compareImageCounter")) {
+      $("compareImageCounter").onclick = () => {
+        const chal = state.wvcFrames[state.wvcChalIdx];
+        const filteredIdx = chal ? state.items.findIndex((it) => it.image_id === chal.image_id) : -1;
+        const cur = filteredIdx >= 0 ? (filteredIdx + 1) : (state.wvcFirstImgPos ? (state.wvcFirstImgPos + state.wvcChalIdx) : 1);
+        const tot = filteredIdx >= 0 ? (state.total || state.items.length) : (state.wvcTotalImgs || 0);
+        openInlineJumpEditor($("compareImageCounter"), cur, tot, "Image", (n) => jumpToImagePositionInWvc(n));
+      };
+    }
+    if ($("loupeCounter")) {
+      $("loupeCounter").onclick = () => {
+        const tot = state.total || state.items.length || 0;
+        openInlineJumpEditor($("loupeCounter"), state.activeIndex + 1, tot, "Image", (n) => jumpToImagePositionInLoupe(n));
+      };
+    }
     document.querySelectorAll("[data-cull-mode]").forEach((btn) => {
       btn.onclick = () => startCulling(btn.dataset.cullMode);
     });
@@ -3021,6 +4093,8 @@
       b.onclick = () => batchUpdate({ label: b.dataset.batchLabel });
     });
     $("btnBatchCull").onclick = () => startCulling("selected");
+    if ($("btnBatchSmartCrop")) $("btnBatchSmartCrop").onclick = () => batchSmartCrop(false);
+    if ($("btnBatchResetCrop")) $("btnBatchResetCrop").onclick = () => batchSmartCrop(true);
     $("btnClearSel").onclick = () => {
       state.selectedIds.clear();
       document.querySelectorAll(".photo-card.selected").forEach((c) => c.classList.remove("selected"));
@@ -3063,6 +4137,233 @@
       $("btnToggleBbox").classList.toggle("active", state.showBbox);
       if (state.items[state.activeIndex]) drawLoupeOverlay(state.items[state.activeIndex]);
     };
+    if ($("btnToggleCropEdit")) $("btnToggleCropEdit").onclick = () => setCropEditMode(!state.cropEditMode);
+    if ($("btnCropEditBtn")) $("btnCropEditBtn").onclick = () => setCropEditMode(!state.cropEditMode);
+    if ($("btnCropAuto")) {
+      $("btnCropAuto").onclick = () => {
+        const img = state.items[state.activeIndex];
+        if (img) runSmartCropAuto(img, false, !!img.crop);
+      };
+    }
+    if ($("btnCropApply")) {
+      $("btnCropApply").onclick = () => {
+        const img = state.items[state.activeIndex];
+        if (!img) return;
+        if (!img.crop && !state.cropDraft) runSmartCropAuto(img, true, false);
+        else saveCropDraft(img, true);
+      };
+    }
+    if ($("btnCropReset")) {
+      $("btnCropReset").onclick = () => {
+        const img = state.items[state.activeIndex];
+        if (img) resetCropForImage(img, "clear");
+      };
+    }
+    if ($("btnCropLockRatio")) {
+      $("btnCropLockRatio").onclick = () => {
+        const img = state.items[state.activeIndex];
+        if (!img) return;
+        const d = ensureCropDraft(img);
+        d.aspect_locked = !d.aspect_locked;
+        if (d.aspect_locked) {
+          const { ow, oh } = getOrigDimsForCrop(img, d);
+          d.aspect_ratio = ((d.right - d.left) * ow) / Math.max(1, (d.bottom - d.top) * oh);
+        }
+        renderLoupeCropPanel(img);
+        saveCropDraft(img, null);
+      };
+    }
+    document.querySelectorAll("#cropRatioPresets .crp-btn").forEach((b) => {
+      b.onclick = () => {
+        const img = state.items[state.activeIndex];
+        if (img) applyCropRatioPreset(img, b.dataset.ratio);
+      };
+    });
+    const angleSlider = $("cropAngleSlider");
+    const angleInput = $("cropAngleInput");
+    const onAngleLive = (val) => {
+      const img = state.items[state.activeIndex];
+      if (!img) return;
+      const d = ensureCropDraft(img);
+      const clamped = Math.max(-15, Math.min(15, Number(val) || 0));
+      d.angle = clamped;
+      d.selected_horizon_idx = null;
+      if (angleSlider) angleSlider.value = clamped.toFixed(1);
+      if (angleInput) angleInput.value = clamped.toFixed(1);
+      positionLoupeCropBox();
+      drawLoupeOverlay(img);
+    };
+    const onAngleReset = () => {
+      const img = state.items[state.activeIndex];
+      if (!img) return;
+      onAngleLive(0);
+      saveCropDraft(img, null);
+      toast("Angle reset to 0.0°", 1100);
+    };
+    if (angleSlider) {
+      angleSlider.addEventListener("input", () => onAngleLive(angleSlider.value));
+      angleSlider.addEventListener("change", () => {
+        const img = state.items[state.activeIndex];
+        if (img) saveCropDraft(img, null);
+      });
+      angleSlider.addEventListener("dblclick", onAngleReset);
+    }
+    if (angleInput) {
+      angleInput.addEventListener("change", () => {
+        onAngleLive(angleInput.value);
+        const img = state.items[state.activeIndex];
+        if (img) saveCropDraft(img, null);
+      });
+      angleInput.addEventListener("dblclick", onAngleReset);
+    }
+    if ($("cropAngleLabel")) $("cropAngleLabel").addEventListener("dblclick", onAngleReset);
+
+    // Interactive Crop Box drag, handle resize, on-frame rotation & double-click reset
+    const cropLayerEl = $("loupeCropLayer");
+    const cropBoxEl = $("loupeCropBox");
+    const startCropRotateDrag = (e, img) => {
+      const d = ensureCropDraft(img);
+      const rect = $("loupeImg").getBoundingClientRect();
+      const cx = rect.left + ((d.left + d.right) * 0.5) * rect.width;
+      const cy = rect.top + ((d.top + d.bottom) * 0.5) * rect.height;
+      const startPointerAngle = Math.atan2(e.clientY - cy, e.clientX - cx) * (180 / Math.PI);
+      state.cropDrag = {
+        handle: "rotate",
+        cx,
+        cy,
+        startPointerAngle,
+        startAngle: Number(d.angle || 0),
+        moved: false,
+      };
+      cropLayerEl?.classList.add("rotating");
+    };
+    if (cropLayerEl) {
+      // Lightroom-style: dragging anywhere outside the crop box rotates the frame directly!
+      cropLayerEl.addEventListener("mousedown", (e) => {
+        if (e.button !== 0 || e.target.closest("#loupeCropBox")) return;
+        const img = state.items[state.activeIndex];
+        if (!img || !state.cropEditMode) return;
+        e.preventDefault();
+        e.stopPropagation();
+        startCropRotateDrag(e, img);
+      });
+    }
+    if (cropBoxEl) {
+      cropBoxEl.addEventListener("dblclick", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.target.closest(".crop-rotate-handle")) {
+          onAngleReset();
+          return;
+        }
+        const img = state.items[state.activeIndex];
+        if (img) resetCropForImage(img, "clear");
+      });
+      cropBoxEl.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        const img = state.items[state.activeIndex];
+        if (!img) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const rotHandle = e.target.closest(".crop-rotate-handle");
+        if (rotHandle) {
+          startCropRotateDrag(e, img);
+          return;
+        }
+        const d = ensureCropDraft(img);
+        const handle = e.target.closest(".crop-handle")?.dataset.handle || "move";
+        const rect = $("loupeImg").getBoundingClientRect();
+        state.cropDrag = {
+          handle,
+          startX: e.clientX,
+          startY: e.clientY,
+          imgW: Math.max(1, rect.width),
+          imgH: Math.max(1, rect.height),
+          startL: d.left,
+          startT: d.top,
+          startR: d.right,
+          startB: d.bottom,
+          moved: false,
+        };
+      });
+      window.addEventListener("mousemove", (e) => {
+        if (!state.cropDrag) return;
+        const img = state.items[state.activeIndex];
+        if (!img) return;
+        const d = ensureCropDraft(img);
+        const dr = state.cropDrag;
+        if (dr.handle === "rotate") {
+          const curPointerAngle = Math.atan2(e.clientY - dr.cy, e.clientX - dr.cx) * (180 / Math.PI);
+          let delta = curPointerAngle - dr.startPointerAngle;
+          if (delta > 180) delta -= 360;
+          if (delta < -180) delta += 360;
+          if (Math.abs(delta) > 0.05) dr.moved = true;
+          const nextAngle = Math.max(-15, Math.min(15, Math.round((dr.startAngle + delta) * 10) / 10));
+          onAngleLive(nextAngle);
+          return;
+        }
+        const dx = (e.clientX - dr.startX) / dr.imgW;
+        const dy = (e.clientY - dr.startY) / dr.imgH;
+        if (Math.abs(dx) > 0.001 || Math.abs(dy) > 0.001) dr.moved = true;
+
+        const minFrac = 0.06;
+        let l = dr.startL, t = dr.startT, r = dr.startR, b = dr.startB;
+        const h = dr.handle;
+
+        if (h === "move") {
+          const bw = r - l, bh = b - t;
+          l = Math.max(0, Math.min(1 - bw, dr.startL + dx));
+          t = Math.max(0, Math.min(1 - bh, dr.startT + dy));
+          r = l + bw;
+          b = t + bh;
+        } else {
+          if (h.includes("w")) l = Math.max(0, Math.min(r - minFrac, dr.startL + dx));
+          if (h.includes("e")) r = Math.min(1, Math.max(l + minFrac, dr.startR + dx));
+          if (h.includes("n")) t = Math.max(0, Math.min(b - minFrac, dr.startT + dy));
+          if (h.includes("s")) b = Math.min(1, Math.max(t + minFrac, dr.startB + dy));
+
+          if (d.aspect_locked && d.aspect_ratio > 0) {
+            const { ow, oh } = getOrigDimsForCrop(img, d);
+            const normRatio = d.aspect_ratio / (ow / oh);
+            if (h === "n" || h === "s") {
+              const nh = b - t;
+              const nw = Math.min(1, nh * normRatio);
+              const cx = (dr.startL + dr.startR) * 0.5;
+              l = Math.max(0, Math.min(1 - nw, cx - nw / 2));
+              r = l + nw;
+            } else {
+              const nw = r - l;
+              const nh = nw / normRatio;
+              if (h.includes("n")) {
+                t = Math.max(0, b - nh);
+                const actualH = b - t;
+                const actualW = actualH * normRatio;
+                if (h.includes("w")) l = r - actualW; else r = l + actualW;
+              } else {
+                b = Math.min(1, t + nh);
+                const actualH = b - t;
+                const actualW = actualH * normRatio;
+                if (h.includes("w")) l = r - actualW; else r = l + actualW;
+              }
+            }
+          }
+        }
+        d.left = Math.max(0, Math.min(1, l));
+        d.top = Math.max(0, Math.min(1, t));
+        d.right = Math.max(d.left + minFrac, Math.min(1, r));
+        d.bottom = Math.max(d.top + minFrac, Math.min(1, b));
+        positionLoupeCropBox();
+        updateCropSizeReadout(img, d);
+      });
+      window.addEventListener("mouseup", () => {
+        if (!state.cropDrag) return;
+        const moved = state.cropDrag.moved;
+        state.cropDrag = null;
+        cropLayerEl?.classList.remove("rotating");
+        const img = state.items[state.activeIndex];
+        if (moved && img) saveCropDraft(img, null);
+      });
+    }
     $("inspCropBox").onclick = () => {
       if (state.zoomMode === "fit" || state.zoomScale <= 1.01) setZoomPreset(100, true);
       else setZoomPreset("fit");
@@ -3081,6 +4382,7 @@
     const imgWrap = $("loupeImgWrap");
     imgWrap.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
+      if (state.cropEditMode && e.target.closest("#loupeCropLayer")) return;
       e.preventDefault();
       state.isDragging = true;
       state.dragMoved = false;
@@ -3255,6 +4557,20 @@
     });
     if ($("btnWvcSwap")) $("btnWvcSwap").onclick = () => wvcSwapWinner();
     if ($("btnWvcKeepBoth")) $("btnWvcKeepBoth").onclick = () => wvcKeepBoth();
+    if ($("btnWvcToggleAf")) {
+      $("btnWvcToggleAf").onclick = () => {
+        state.showAfPoints = !state.showAfPoints;
+        $("btnToggleAf")?.classList.toggle("active", state.showAfPoints);
+        drawWvcOverlays();
+      };
+    }
+    if ($("btnWvcToggleHighlights")) {
+      $("btnWvcToggleHighlights").onclick = () => {
+        state.showHighlights = !state.showHighlights;
+        $("btnToggleHighlights")?.classList.toggle("active", state.showHighlights);
+        drawWvcOverlays();
+      };
+    }
     if ($("btnWvcPinChallenger")) {
       $("btnWvcPinChallenger").onclick = () => {
         state.wvcWinnerIdx = state.wvcChalIdx;
@@ -3376,6 +4692,21 @@
       const tag = (target?.tagName || "").toLowerCase();
       const inputType = (target?.type || "").toLowerCase();
       const pressedDigit = getPressedDigit(e);
+
+      // In Loupe (Crop Edit mode, or when a crop suggestion/draft exists), Enter ALWAYS applies the crop and does nothing else!
+      if (e.key === "Enter" && state.view === "loupe" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const activeModal = document.querySelector(".modal-backdrop:not(.hidden)");
+        const curImg = state.items[state.activeIndex];
+        if (!activeModal && curImg && (state.cropEditMode || curImg.crop || state.cropDraft) && !target?.closest(".jump-chip") && target?.id !== "searchInput" && target?.id !== "inputBookmarkLabel") {
+          e.preventDefault();
+          e.stopPropagation();
+          if (target && typeof target.blur === "function") target.blur();
+          if (target?.id === "cropAngleInput") onAngleLive(target.value);
+          saveCropDraft(curImg, true);
+          return;
+        }
+      }
+
       // Only block shortcuts when typing inside text/search/number inputs or textareas (NOT checkboxes or buttons!)
       if (tag === "textarea" || (tag === "input" && !["checkbox", "radio", "range", "button"].includes(inputType))) return;
       if (tag === "select" && e.key !== "Escape") {
@@ -3412,7 +4743,22 @@
       }
 
       if (e.key === "Escape") {
-        document.querySelectorAll(".modal-backdrop").forEach((m) => m.classList.add("hidden"));
+        const openModals = Array.from(document.querySelectorAll(".modal-backdrop")).filter((m) => !m.classList.contains("hidden"));
+        if (openModals.length) {
+          openModals.forEach((m) => m.classList.add("hidden"));
+          return;
+        }
+        if (state.view === "compare" && state.wvcSelectedIds.size > 0) {
+          state.wvcSelectedIds.clear();
+          renderWvc();
+          return;
+        }
+        if (state.selectedIds.size > 0) {
+          state.selectedIds.clear();
+          updateBatchBar();
+          syncGridSelectionDom();
+          return;
+        }
         if (state.view === "compare") setView(state.wvcReturnView || "grid");
         else if (state.view !== "grid") setView("grid");
         return;
@@ -3462,20 +4808,32 @@
         }
         if (code === "KeyS" || k === "s") { e.preventDefault(); wvcSwapWinner(); return; }
         if (code === "KeyK" || k === "k") { e.preventDefault(); wvcKeepBoth(); return; }
+        if (code === "KeyF" || k === "f") { e.preventDefault(); $("btnWvcToggleAf")?.click(); return; }
+        if (code === "KeyH" || k === "h") { e.preventDefault(); $("btnWvcToggleHighlights")?.click(); return; }
         if (chal && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          const wvcTargets = getTargetSelectionIds(chal, true);
           if (pressedDigit >= 0 && pressedDigit <= 5) {
             e.preventDefault();
-            toast(`${chal.filename} → ${pressedDigit}★`, 1100);
-            setRating(chal, pressedDigit, false).then(() => renderWvc());
+            if (wvcTargets.length > 1) {
+              batchUpdate({ rating: pressedDigit }, wvcTargets);
+            } else {
+              toast(`${chal.filename} → ${pressedDigit}★`, 1100);
+              setRating(chal, pressedDigit, false).then(() => renderWvc());
+            }
             return;
           }
           const colorByDigit = { 6: "Red", 7: "Yellow", 8: "Green", 9: "Blue" };
           const cTarget = colorByDigit[pressedDigit] || ((code === "KeyP" || k === "p") ? "Purple" : "");
           if (cTarget) {
             e.preventDefault();
+            // Always toggle based on the MAIN selected image (chal)
             const nextLbl = chal.effective_label === cTarget ? "" : cTarget;
-            toast(`${chal.filename} → ${nextLbl || "No Color"}`, 1100);
-            setColorLabel(chal, nextLbl, false).then(() => renderWvc());
+            if (wvcTargets.length > 1) {
+              batchUpdate({ label: nextLbl }, wvcTargets);
+            } else {
+              toast(`${chal.filename} → ${nextLbl || "No Color"}`, 1100);
+              setColorLabel(chal, nextLbl, false).then(() => renderWvc());
+            }
             return;
           }
         }
@@ -3520,6 +4878,11 @@
         }
       } else if (code === "KeyB" || k === "b") {
         if (state.view === "loupe") $("btnToggleBbox").click();
+      } else if (code === "KeyR" || k === "r") {
+        if (state.view === "loupe" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          setCropEditMode(!state.cropEditMode);
+        }
       } else if (code === "KeyS" || k === "s") {
         if (state.view === "loupe" && !e.ctrlKey && !e.metaKey && !e.altKey) {
           e.preventDefault();
@@ -3534,37 +4897,18 @@
       } else if (pressedDigit >= 0 && pressedDigit <= 5) {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
-        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ rating: pressedDigit });
+        const targets = getTargetSelectionIds(activeImg, false);
+        if (targets.length > 1) batchUpdate({ rating: pressedDigit }, targets);
         else { toast(`${activeImg.filename} → ${pressedDigit}★`, 1100); setRating(activeImg, pressedDigit); }
-      } else if (pressedDigit === 6) {
+      } else if (pressedDigit === 6 || pressedDigit === 7 || pressedDigit === 8 || pressedDigit === 9 || code === "KeyP" || k === "p") {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         e.preventDefault();
-        const nextLbl = activeImg.effective_label === "Red" ? "" : "Red";
-        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Red" });
-        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
-      } else if (pressedDigit === 7) {
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-        e.preventDefault();
-        const nextLbl = activeImg.effective_label === "Yellow" ? "" : "Yellow";
-        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Yellow" });
-        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
-      } else if (pressedDigit === 8) {
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-        e.preventDefault();
-        const nextLbl = activeImg.effective_label === "Green" ? "" : "Green";
-        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Green" });
-        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
-      } else if (pressedDigit === 9) {
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-        e.preventDefault();
-        const nextLbl = activeImg.effective_label === "Blue" ? "" : "Blue";
-        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Blue" });
-        else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
-      } else if (code === "KeyP" || k === "p") {
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-        e.preventDefault();
-        const nextLbl = activeImg.effective_label === "Purple" ? "" : "Purple";
-        if (state.view === "grid" && state.selectedIds.size > 0) batchUpdate({ label: "Purple" });
+        const colorByDigit = { 6: "Red", 7: "Yellow", 8: "Green", 9: "Blue" };
+        const cTarget = colorByDigit[pressedDigit] || "Purple";
+        // Always decide toggle direction from the MAIN selected image (activeImg)
+        const nextLbl = activeImg.effective_label === cTarget ? "" : cTarget;
+        const targets = getTargetSelectionIds(activeImg, false);
+        if (targets.length > 1) batchUpdate({ label: nextLbl }, targets);
         else { toast(`${activeImg.filename} → ${nextLbl || "No Color"}`, 1100); setColorLabel(activeImg, nextLbl); }
       } else if (code === "KeyX" || k === "x") {
         setUserFlag(activeImg, -1);

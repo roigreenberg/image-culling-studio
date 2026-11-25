@@ -268,32 +268,87 @@ def _is_good(rec: Dict[str, Any], cfg: PipelineConfig) -> bool:
     return False
 
 
-def _is_long_action_sequence(members: List[Dict[str, Any]]) -> bool:
-    """Detect genuine flying-bird / dynamic action sequences (>= 6 frames with strong flight/motion)."""
+def _is_long_action_sequence(
+    members: List[Dict[str, Any]],
+    siglip_embs: Optional[np.ndarray] = None,
+) -> bool:
+    """
+    Detect genuine dynamic action events worth keeping as a full burst — e.g.,
+    a bird taking off, landing, vigorously flapping, diving, or undergoing a
+    dramatic pose/shape transition.
+
+    Deliberately excludes steady flat glides (e.g., soaring birds with static
+    wings) and perched birds holding a static pose across many frames.
+    """
     if len(members) < 6:
         return False
     w_members = [m for m in members if m.get("track") == "Wildlife"]
     if len(w_members) < 5:
         return False
-    act_scores = [float(m.get("action_score", 0.0)) for m in w_members]
+
+    w_sorted = sorted(w_members, key=lambda m: float(m.get("timestamp") or 0.0))
+    act_scores = np.array([float(m.get("action_score", 0.0)) for m in w_sorted], dtype=np.float64)
     mean_act = float(np.mean(act_scores))
-    high_act_cnt = sum(1 for a in act_scores if a >= 76.0)
-    if mean_act >= 75.0 or (high_act_cnt >= 4 and mean_act >= 68.0):
+    max_act = float(np.max(act_scores))
+    act_range = float(np.percentile(act_scores, 95) - np.percentile(act_scores, 5))
+
+    # Must have meaningful flight / action energy somewhere in the burst
+    if mean_act < 58.0 and not (max_act >= 78.0 and act_range >= 32.0):
+        return False
+
+    # 1) Measure silhouette / wing-shape evolution from subject bbox aspect ratios
+    ars: List[float] = []
+    for m in w_sorted:
+        bb = m.get("bbox") or []
+        if len(bb) == 4 and (bb[2] > bb[0]) and (bb[3] > bb[1]):
+            bw = float(bb[2] - bb[0])
+            bh = float(bb[3] - bb[1])
+            ars.append(bw / max(1.0, bh))
+
+    has_bbox = len(ars) >= 4
+    ar_cv = 0.0
+    ar_ratio = 1.0
+    if has_bbox:
+        ar_arr = np.array(ars, dtype=np.float64)
+        ar_cv = float(np.std(ar_arr) / max(0.05, float(np.mean(ar_arr))))
+        ar_ratio = float(np.percentile(ar_arr, 90) / max(0.05, float(np.percentile(ar_arr, 10))))
+
+    # 2) Measure frame-to-frame visual / pose evolution from SigLIP embeddings
+    has_embs = False
+    pose_spread = 0.0
+    consec_change = 0.0
+    if siglip_embs is not None:
+        idxs = [
+            int(m["_emb_idx"])
+            for m in w_sorted
+            if "_emb_idx" in m and 0 <= int(m["_emb_idx"]) < len(siglip_embs)
+        ]
+        if len(idxs) >= 4:
+            embs = siglip_embs[idxs].astype(np.float32)
+            norms = np.linalg.norm(embs, axis=1, keepdims=True)
+            embs = embs / np.maximum(norms, 1e-8)
+            centroid = embs.mean(axis=0)
+            centroid /= max(1e-8, float(np.linalg.norm(centroid)))
+            pose_spread = float(1.0 - np.mean(embs @ centroid))
+            consec_change = float(1.0 - np.mean(np.sum(embs[:-1] * embs[1:], axis=1)))
+            has_embs = True
+
+    # Criterion A: Strong wingbeat / takeoff / landing shape transformation
+    if has_bbox and ar_cv >= 0.35 and ar_ratio >= 2.0:
         return True
 
-    # Also check strong subject bbox motion across the sequence paired with action
-    cxs, cys = [], []
-    for m in w_members:
-        bb = m.get("bbox") or []
-        pw = max(1, int(m.get("preview_width", 1)))
-        ph = max(1, int(m.get("preview_height", 1)))
-        if len(bb) == 4:
-            cxs.append(((bb[0] + bb[2]) * 0.5) / pw)
-            cys.append(((bb[1] + bb[3]) * 0.5) / ph)
-    if len(cxs) >= 5:
-        pos_spread = max(float(np.std(cxs)), float(np.std(cys)))
-        if pos_spread >= 0.085 and mean_act >= 58.0:
-            return True
+    # Criterion B: Perched-to-takeoff (or landing) surge in action score + shape shift
+    if has_bbox and act_range >= 35.0 and max_act >= 78.0 and ar_cv >= 0.28:
+        return True
+
+    # Criterion C: Strong frame-to-frame visual/pose evolution (e.g., dive, strike, bank)
+    if has_embs and pose_spread >= 0.020 and consec_change >= 0.015:
+        return True
+
+    # Fallback ONLY when neither bbox nor embeddings exist (minimal synthetic inputs)
+    if not has_bbox and not has_embs and mean_act >= 80.0:
+        return True
+
     return False
 
 
@@ -340,7 +395,7 @@ def select_layers_final(
                 m["layer"] = "layer1_keep"
             continue
 
-        if _is_long_action_sequence(members):
+        if _is_long_action_sequence(members, siglip_embs=siglip_embs):
             action_seq_count += 1
             for m in members:
                 m["scenario_type"] = "action_sequence"
@@ -444,6 +499,24 @@ def select_layers_final(
             else:
                 rec["layer"] = "to_delete"
                 to_del_count += 1
+
+    # Guarantee every multi-frame burst has at least 1 Keep image unless all frames are bad
+    for sid, members in scenes.items():
+        if len(members) < 2:
+            continue
+        if any(m["layer"] in ("layer1_keep", "layer2_to_edit") for m in members):
+            continue
+        non_bad = [
+            m
+            for m in members
+            if m["layer"] != "to_delete" and m.get("track") in ("Wildlife", "Landscape")
+        ]
+        if non_bad:
+            best = max(
+                non_bad,
+                key=lambda r: (float(r.get("overall_score") or 0.0), float(r.get("sharpness_score") or 0.0)),
+            )
+            best["layer"] = "layer1_keep"
 
     # Assign global overall_rank
     layer_order = {"layer2_to_edit": 0, "layer1_keep": 1, "rejected": 2, "to_delete": 3}

@@ -233,6 +233,24 @@ class CullDatabase:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_burst_splits_dir ON burst_splits(dir_id);
+
+                CREATE TABLE IF NOT EXISTS bookmarks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dir_id TEXT NOT NULL,
+                    label TEXT DEFAULT '',
+                    view TEXT NOT NULL DEFAULT 'compare',
+                    subfolder TEXT DEFAULT '',
+                    burst_id TEXT DEFAULT '',
+                    winner_id TEXT DEFAULT '',
+                    chal_id TEXT DEFAULT '',
+                    image_id TEXT DEFAULT '',
+                    filename TEXT DEFAULT '',
+                    burst_pos INTEGER DEFAULT 0,
+                    image_pos INTEGER DEFAULT 0,
+                    scroll_top INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bookmarks_dir ON bookmarks(dir_id, id DESC);
                 """
             )
             # Safe schema migration for existing DBs
@@ -248,6 +266,10 @@ class CullDatabase:
                 ("hybrid_bonus", "INTEGER DEFAULT 0"),
                 ("tonal_balance", "REAL DEFAULT 0"),
                 ("kestrel_quality", "REAL DEFAULT 0"),
+                ("orig_width", "INTEGER DEFAULT 0"),
+                ("orig_height", "INTEGER DEFAULT 0"),
+                ("crop_json", "TEXT DEFAULT ''"),
+                ("crop_applied", "INTEGER DEFAULT 0"),
             ]
             for col_name, col_def in migrations:
                 if col_name not in cols:
@@ -701,6 +723,15 @@ class CullDatabase:
                 d["af_points"] = json.loads(raw_af)
             except Exception:
                 d["af_points"] = []
+        raw_crop = d.pop("crop_json", None)
+        if raw_crop:
+            try:
+                d["crop"] = json.loads(raw_crop)
+            except Exception:
+                d["crop"] = None
+        else:
+            d["crop"] = None
+        d["crop_applied"] = bool(d.get("crop_applied"))
         return d
 
     def query_images(
@@ -891,10 +922,17 @@ class CullDatabase:
             ).fetchall()
         return [self._row_to_image(r) for r in rows]
 
-    def get_burst_position_info(self, dir_id: str, burst_id: str, subfolder: str = "") -> Dict[str, int]:
-        """Return 1-based burst position, total bursts, first frame's 1-based image position, and total images."""
+    def get_burst_position_info(self, dir_id: str, burst_id: str, subfolder: str = "") -> Dict[str, Any]:
+        """Return 1-based burst position, total bursts, prev/next burst IDs, first frame's 1-based image position, and total images."""
         if not burst_id:
-            return {"burst_pos": 0, "total_bursts": 0, "first_image_pos": 0, "total_images": 0}
+            return {
+                "burst_pos": 0,
+                "total_bursts": 0,
+                "prev_burst_id": "",
+                "next_burst_id": "",
+                "first_image_pos": 0,
+                "total_images": 0,
+            }
         with self._lock, self._connect() as conn:
             sub_clause = " AND subfolder = ?" if subfolder else ""
             sub_params: List[Any] = [dir_id] + ([subfolder] if subfolder else [])
@@ -906,9 +944,15 @@ class CullDatabase:
             ).fetchall()
             total_bursts = len(burst_rows)
             burst_pos = 0
+            prev_burst_id = ""
+            next_burst_id = ""
             for idx, r in enumerate(burst_rows, start=1):
                 if r["burst_id"] == burst_id:
                     burst_pos = idx
+                    if idx > 1:
+                        prev_burst_id = str(burst_rows[idx - 2]["burst_id"] or "")
+                    if idx < total_bursts:
+                        next_burst_id = str(burst_rows[idx]["burst_id"] or "")
                     break
 
             total_images = int(
@@ -938,9 +982,108 @@ class CullDatabase:
         return {
             "burst_pos": burst_pos,
             "total_bursts": total_bursts,
+            "prev_burst_id": prev_burst_id,
+            "next_burst_id": next_burst_id,
             "first_image_pos": first_image_pos,
             "total_images": total_images,
         }
+
+    def get_burst_at_position(self, dir_id: str, pos: int, subfolder: str = "") -> Dict[str, Any]:
+        """Return burst_id at 1-based chronological burst position `pos` (clamped 1..total_bursts)."""
+        with self._lock, self._connect() as conn:
+            sub_clause = " AND subfolder = ?" if subfolder else ""
+            sub_params: List[Any] = [dir_id] + ([subfolder] if subfolder else [])
+            burst_rows = conn.execute(
+                f"SELECT burst_id FROM images WHERE dir_id = ? AND burst_id != ''{sub_clause} "
+                f"GROUP BY burst_id ORDER BY MIN(timestamp) ASC, burst_id ASC",
+                sub_params,
+            ).fetchall()
+            total_bursts = len(burst_rows)
+            if total_bursts == 0:
+                return {"ok": False, "burst_id": "", "pos": 0, "total_bursts": 0}
+            clamped = max(1, min(total_bursts, int(pos)))
+            return {
+                "ok": True,
+                "burst_id": str(burst_rows[clamped - 1]["burst_id"]),
+                "pos": clamped,
+                "total_bursts": total_bursts,
+            }
+
+    def get_image_at_position(self, dir_id: str, pos: int, subfolder: str = "") -> Dict[str, Any]:
+        """Return image_id, burst_id, filename at 1-based chronological image position `pos`."""
+        with self._lock, self._connect() as conn:
+            sub_clause = " AND subfolder = ?" if subfolder else ""
+            sub_params: List[Any] = [dir_id] + ([subfolder] if subfolder else [])
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) AS c FROM images WHERE dir_id = ?{sub_clause}",
+                    sub_params,
+                ).fetchone()["c"]
+            )
+            if total == 0:
+                return {"ok": False, "image_id": "", "burst_id": "", "filename": "", "pos": 0, "total_images": 0}
+            clamped = max(1, min(total, int(pos)))
+            row = conn.execute(
+                f"SELECT image_id, burst_id, filename FROM images WHERE dir_id = ?{sub_clause} "
+                f"ORDER BY timestamp ASC, filename ASC LIMIT 1 OFFSET ?",
+                sub_params + [clamped - 1],
+            ).fetchone()
+            if not row:
+                return {"ok": False, "image_id": "", "burst_id": "", "filename": "", "pos": 0, "total_images": total}
+            return {
+                "ok": True,
+                "image_id": str(row["image_id"]),
+                "burst_id": str(row["burst_id"] or ""),
+                "filename": str(row["filename"] or ""),
+                "pos": clamped,
+                "total_images": total,
+            }
+
+    # ------------------------------------------------------------------
+    # Bookmarks (Jump back to exact View / Burst / Image position)
+    # ------------------------------------------------------------------
+    def list_bookmarks(self, dir_id: str) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM bookmarks WHERE dir_id = ? ORDER BY id DESC LIMIT 100",
+                (dir_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_bookmark(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO bookmarks (
+                    dir_id, label, view, subfolder, burst_id, winner_id, chal_id,
+                    image_id, filename, burst_pos, image_pos, scroll_top, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("dir_id") or ""),
+                    str(payload.get("label") or ""),
+                    str(payload.get("view") or "compare"),
+                    str(payload.get("subfolder") or ""),
+                    str(payload.get("burst_id") or ""),
+                    str(payload.get("winner_id") or ""),
+                    str(payload.get("chal_id") or ""),
+                    str(payload.get("image_id") or ""),
+                    str(payload.get("filename") or ""),
+                    int(payload.get("burst_pos") or 0),
+                    int(payload.get("image_pos") or 0),
+                    int(payload.get("scroll_top") or 0),
+                    now,
+                ),
+            )
+            bid = cur.lastrowid
+            row = conn.execute("SELECT * FROM bookmarks WHERE id = ?", (bid,)).fetchone()
+        return dict(row) if row else {"id": bid}
+
+    def delete_bookmark(self, bookmark_id: int) -> bool:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM bookmarks WHERE id = ?", (int(bookmark_id),))
+            return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # Manual Burst Split / Unsplit (Persisted across Reselect & Re-import)
@@ -1717,7 +1860,97 @@ class CullDatabase:
                     "UPDATE images SET user_flag = ?, user_modified_at = ? WHERE image_id = ?",
                     (int(old_value or 0), utc_now_iso(), image_id),
                 )
+            elif field == "crop":
+                old_crop_str = old_value or ""
+                old_applied = 0
+                if old_crop_str:
+                    try:
+                        old_applied = 1 if json.loads(old_crop_str).get("applied") else 0
+                    except Exception:
+                        old_applied = 0
+                conn.execute(
+                    "UPDATE images SET crop_json = ?, crop_applied = ?, user_modified_at = ? WHERE image_id = ?",
+                    (old_crop_str, old_applied, utc_now_iso(), image_id),
+                )
             conn.execute("UPDATE change_log SET reverted = 1 WHERE id = ?", (change_id,))
+
+    # ------------------------------------------------------------------
+    # Smart Crop & Straighten Persistence
+    # ------------------------------------------------------------------
+    def save_image_crop(
+        self,
+        image_id: str,
+        crop: Optional[Dict[str, Any]],
+        orig_width: int = 0,
+        orig_height: int = 0,
+        record_change: bool = False,
+        action_type: str = "crop",
+        xmp_synced: bool = False,
+        prev_xmp_xml: Optional[str] = None,
+        batch_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Persist crop suggestion or applied crop/angle state, optionally logging to change_log."""
+        now = utc_now_iso()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM images WHERE image_id = ?", (image_id,)).fetchone()
+            if not row:
+                return None
+            old_crop_json = row["crop_json"] or ""
+            new_crop_json = json.dumps(crop, ensure_ascii=False) if crop else ""
+            applied_int = 1 if (crop and crop.get("applied")) else 0
+            ow = int(orig_width or (crop.get("orig_width") if crop else 0) or row["orig_width"] or 0)
+            oh = int(orig_height or (crop.get("orig_height") if crop else 0) or row["orig_height"] or 0)
+
+            conn.execute(
+                """
+                UPDATE images
+                SET crop_json = ?, crop_applied = ?, orig_width = ?, orig_height = ?,
+                    user_modified_at = CASE WHEN ? THEN ? ELSE user_modified_at END
+                WHERE image_id = ?
+                """,
+                (new_crop_json, applied_int, ow, oh, 1 if record_change else 0, now, image_id),
+            )
+            if record_change and old_crop_json != new_crop_json:
+                conn.execute(
+                    """
+                    INSERT INTO change_log(
+                        timestamp, dir_id, image_id, filename, action_type, field,
+                        old_value, new_value, prev_xmp_xml, xmp_synced, batch_id,
+                        ai_layer_at_time, ai_score_at_time
+                    ) VALUES (?, ?, ?, ?, ?, 'crop', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now,
+                        row["dir_id"],
+                        image_id,
+                        row["filename"],
+                        action_type,
+                        old_crop_json,
+                        new_crop_json,
+                        prev_xmp_xml if xmp_synced else None,
+                        1 if xmp_synced else 0,
+                        batch_id,
+                        row["ai_layer"],
+                        float(row["overall_score"] or 0.0),
+                    ),
+                )
+        return self.get_image(image_id)
+
+    def get_layer2_images_needing_crop(self, dir_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+        """Return Layer 2 / Green images in a directory that do not yet have a smart crop suggestion."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM images
+                WHERE dir_id = ?
+                  AND (effective_label = 'Green' OR ai_layer = 'layer2_to_edit')
+                  AND (crop_json IS NULL OR crop_json = '')
+                ORDER BY overall_rank ASC
+                LIMIT ?
+                """,
+                (dir_id, int(limit)),
+            ).fetchall()
+        return [self._row_to_image(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Pipeline Runs

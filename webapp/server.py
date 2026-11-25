@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src.smart_crop import DEFAULT_MIN_LONG_PX, clamp_crop_to_image, compute_smart_crop
 from src.updater import check_for_updates, download_and_apply_update, get_version_info
 from webapp.db import CullDatabase, make_dir_id
 from webapp.pipeline_runner import TaskManager
@@ -53,6 +54,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             if not facets.get("lenses") and (d.get("stats", {}).get("rated", 0) == 0):
                 logger.info("Auto-starting background EXIF/Camera/XMP scan for %s", src_path)
                 tasks.start_directory_scan(d["dir_id"])
+        # Pre-calculate suggested (unapplied) smart crops for Layer 2 / Green images in background
+        _start_layer2_smart_crop_bg(d["dir_id"])
     yield
 
 
@@ -122,6 +125,36 @@ class BurstSplitRequest(BaseModel):
     image_id: str
 
 
+class SmartCropRequest(BaseModel):
+    apply: bool = False
+    force: bool = False
+    min_long_px: int = DEFAULT_MIN_LONG_PX
+
+
+class CropUpdateRequest(BaseModel):
+    left: float
+    top: float
+    right: float
+    bottom: float
+    angle: float = 0.0
+    aspect_locked: bool = True
+    aspect_ratio: Optional[float] = None
+    selected_horizon_idx: Optional[int] = None
+    applied: bool = True
+
+
+class CropResetRequest(BaseModel):
+    mode: str = "clear"  # "clear" (reset to uncropped 0..1) or "auto" (recompute smart suggestion)
+
+
+class BatchSmartCropRequest(BaseModel):
+    image_ids: List[str]
+    apply: bool = True
+    reset: bool = False
+    force: bool = False
+    min_long_px: int = DEFAULT_MIN_LONG_PX
+
+
 class PreviewGenRequest(BaseModel):
     dir_id: str
     subfolder: str = ""
@@ -142,6 +175,21 @@ class SessionStateRequest(BaseModel):
 class UpdateApplyRequest(BaseModel):
     download_url: Optional[str] = None
     repo: Optional[str] = None
+
+
+class BookmarkCreateRequest(BaseModel):
+    dir_id: str
+    label: str = ""
+    view: str = "compare"
+    subfolder: str = ""
+    burst_id: str = ""
+    winner_id: str = ""
+    chal_id: str = ""
+    image_id: str = ""
+    filename: str = ""
+    burst_pos: int = 0
+    image_pos: int = 0
+    scroll_top: int = 0
 
 
 _update_lock = threading.Lock()
@@ -394,6 +442,22 @@ async def query_bursts(
     return res
 
 
+@app.get("/api/bursts/{dir_id}/at-position")
+async def get_burst_at_position(dir_id: str, pos: int = Query(..., ge=1), subfolder: str = "") -> Dict[str, Any]:
+    res = db.get_burst_at_position(dir_id, pos, subfolder=subfolder)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail="No bursts found in directory")
+    return res
+
+
+@app.get("/api/images/{dir_id}/at-position")
+async def get_image_at_position(dir_id: str, pos: int = Query(..., ge=1), subfolder: str = "") -> Dict[str, Any]:
+    res = db.get_image_at_position(dir_id, pos, subfolder=subfolder)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail="No images found in directory")
+    return res
+
+
 @app.get("/api/bursts/{dir_id}/{burst_id}")
 async def get_burst_all_frames(dir_id: str, burst_id: str, subfolder: str = "") -> Dict[str, Any]:
     items = db.get_burst_siblings(dir_id, burst_id)
@@ -563,6 +627,12 @@ async def update_image_metadata(image_id: str, req: MetadataUpdateRequest) -> Di
         xmp_synced=xmp_synced,
         prev_xmp_xml=prev_xml,
     )
+    # Requirement 1: Auto-calculate smart crop suggestion (not applied) when marked Green
+    if updated and updated.get("effective_label") == "Green" and not updated.get("crop"):
+        try:
+            updated = _compute_and_save_crop(updated, apply=False, record_change=False) or updated
+        except Exception as exc:
+            logger.debug("Auto smart-crop on Green label failed for %s: %s", image_id, exc)
     return {"image": updated, "xmp_synced": xmp_synced, "xmp_warning": xmp_warning}
 
 
@@ -613,6 +683,8 @@ async def batch_update_metadata(req: BatchMetadataUpdateRequest) -> Dict[str, An
         f"Batch updated {updated_count} images (XMP synced: {xmp_ok}, failed: {xmp_fail})",
         {"batch_id": batch_id, "rating": req.rating, "label": req.label},
     )
+    if req.label is not None and normalize_label(req.label) == "Green" and req.image_ids:
+        _start_smart_crop_bg_for_ids(list(req.image_ids))
     return {"updated": updated_count, "xmp_synced": xmp_ok, "xmp_failed": xmp_fail, "batch_id": batch_id}
 
 
@@ -654,7 +726,11 @@ def _restore_single_change(entry: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         else:
             # prev_xml is None means no .xmp existed prior to this edit. Only remove the newly
             # created sidecar if no rating/label remains; otherwise rewrite the remaining state.
-            if (updated_img.get("effective_rating") or 0) == 0 and not (updated_img.get("effective_label") or ""):
+            if (
+                (updated_img.get("effective_rating") or 0) == 0
+                and not (updated_img.get("effective_label") or "")
+                and not updated_img.get("crop_applied")
+            ):
                 ok, err = restore_xmp_sidecar(src_path, None)
                 if not ok:
                     xmp_err = err
@@ -693,7 +769,11 @@ def _restore_change_group(entries: List[Dict[str, Any]]) -> List[str]:
             src_path = Path(updated_img["source_path"])
             if prev_xml is not None:
                 restore_xmp_sidecar(src_path, prev_xml)
-            elif (updated_img.get("effective_rating") or 0) == 0 and not (updated_img.get("effective_label") or ""):
+            elif (
+                (updated_img.get("effective_rating") or 0) == 0
+                and not (updated_img.get("effective_label") or "")
+                and not updated_img.get("crop_applied")
+            ):
                 restore_xmp_sidecar(src_path, None)
             else:
                 write_xmp_sidecar(
@@ -906,6 +986,355 @@ async def get_session() -> Dict[str, Any]:
 async def put_session(req: SessionStateRequest) -> Dict[str, Any]:
     db.save_session_state(req.state)
     return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# Bookmarks (Jump back to exact View / Burst / Image position)
+# ------------------------------------------------------------------
+@app.get("/api/bookmarks")
+async def get_bookmarks(dir_id: str) -> Dict[str, Any]:
+    return {"bookmarks": db.list_bookmarks(dir_id)}
+
+
+@app.post("/api/bookmarks")
+async def create_bookmark(req: BookmarkCreateRequest) -> Dict[str, Any]:
+    bm = db.add_bookmark(req.model_dump())
+    return {"ok": True, "bookmark": bm}
+
+
+@app.delete("/api/bookmarks/{bookmark_id}")
+async def remove_bookmark(bookmark_id: int) -> Dict[str, Any]:
+    ok = db.delete_bookmark(bookmark_id)
+    return {"ok": ok}
+
+
+# ------------------------------------------------------------------
+# Auto Smart Straighten & Bird-Aware Smart Crop
+# ------------------------------------------------------------------
+def _resolve_crop_preview_path(img: Dict[str, Any]) -> Optional[Path]:
+    d = db.get_directory(img["dir_id"])
+    if not d:
+        return None
+    out_dir = Path(d["output_dir"])
+    for key in ("hq_preview_rel_path", "export_layer2_path", "thumb_rel_path"):
+        rel = img.get(key) or ""
+        if rel:
+            cand = out_dir / rel
+            try:
+                if cand.is_file():
+                    return cand
+            except OSError:
+                pass
+    return None
+
+
+def _compute_and_save_crop(
+    img: Dict[str, Any],
+    *,
+    apply: bool = False,
+    force: bool = False,
+    min_long_px: int = DEFAULT_MIN_LONG_PX,
+    record_change: bool = False,
+    action_type: str = "smart_crop",
+    batch_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    existing = img.get("crop")
+    if existing and not force:
+        crop = dict(existing)
+    else:
+        crop = compute_smart_crop(
+            source_path=Path(img["source_path"]) if img.get("source_path") else None,
+            preview_path=_resolve_crop_preview_path(img),
+            bbox=img.get("bbox"),
+            head_bbox=img.get("head_bbox"),
+            preview_width=int(img.get("preview_width") or 0),
+            preview_height=int(img.get("preview_height") or 0),
+            orig_width=int(img.get("orig_width") or 0),
+            orig_height=int(img.get("orig_height") or 0),
+            track=img.get("track") or "",
+            min_long_px=int(min_long_px or DEFAULT_MIN_LONG_PX),
+            aspect_locked=True,
+        )
+
+    crop["applied"] = bool(apply)
+    xmp_synced = False
+    prev_xml: Optional[str] = None
+    settings = db.get_settings()
+    if apply and bool(settings.get("realtime_xmp_write", True)) and img.get("source_path"):
+        ok, prev_xml, _, err = write_xmp_sidecar(Path(img["source_path"]), crop=crop)
+        if ok:
+            xmp_synced = True
+        else:
+            db.add_event_log("WARNING", "xmp", f"Crop XMP write failed for {img['filename']}: {err}")
+
+    return db.save_image_crop(
+        image_id=img["image_id"],
+        crop=crop,
+        orig_width=int(crop.get("orig_width") or 0),
+        orig_height=int(crop.get("orig_height") or 0),
+        record_change=record_change or apply,
+        action_type=action_type,
+        xmp_synced=xmp_synced,
+        prev_xmp_xml=prev_xml,
+        batch_id=batch_id,
+    )
+
+
+def _start_smart_crop_bg_for_ids(image_ids: List[str]) -> None:
+    def _worker() -> None:
+        done_ids: List[str] = []
+        dir_id = ""
+        for iid in image_ids:
+            img = db.get_image(iid)
+            if not img or img.get("crop"):
+                continue
+            dir_id = img["dir_id"]
+            try:
+                _compute_and_save_crop(img, apply=False, record_change=False)
+                done_ids.append(iid)
+            except Exception as exc:
+                logger.debug("Background smart crop failed for %s: %s", iid, exc)
+        if done_ids:
+            broadcast_event({"type": "smart_crop_ready", "dir_id": dir_id, "image_ids": done_ids, "count": len(done_ids)})
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _start_layer2_smart_crop_bg(dir_id: str) -> int:
+    pending = db.get_layer2_images_needing_crop(dir_id, limit=500)
+    if not pending:
+        return 0
+    _start_smart_crop_bg_for_ids([r["image_id"] for r in pending])
+    return len(pending)
+
+
+@app.post("/api/directories/{dir_id}/smart-crop-layer2")
+async def trigger_layer2_smart_crop(dir_id: str) -> Dict[str, Any]:
+    d = db.get_directory(dir_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="Directory not found")
+    queued = _start_layer2_smart_crop_bg(dir_id)
+    return {"ok": True, "queued": queued}
+
+
+@app.post("/api/images/{image_id}/smart-crop")
+async def compute_or_apply_smart_crop(image_id: str, req: Optional[SmartCropRequest] = None) -> Dict[str, Any]:
+    img = db.get_image(image_id)
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+    r = req or SmartCropRequest()
+    updated = await asyncio.to_thread(
+        _compute_and_save_crop,
+        img,
+        apply=r.apply,
+        force=r.force,
+        min_long_px=r.min_long_px,
+        record_change=r.apply,
+        action_type="smart_crop",
+    )
+    return {"image": updated, "crop": updated.get("crop") if updated else None}
+
+
+@app.put("/api/images/{image_id}/crop")
+async def update_image_crop(image_id: str, req: CropUpdateRequest) -> Dict[str, Any]:
+    img = db.get_image(image_id)
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    existing = dict(img.get("crop") or {})
+    orig_w = int(existing.get("orig_width") or img.get("orig_width") or img.get("preview_width") or 1)
+    orig_h = int(existing.get("orig_height") or img.get("orig_height") or img.get("preview_height") or 1)
+    img_aspect = orig_w / float(max(1, orig_h))
+
+    angle = max(-45.0, min(45.0, float(req.angle)))
+    locked_ratio = None
+    if req.aspect_locked:
+        locked_ratio = float(req.aspect_ratio) if (req.aspect_ratio and req.aspect_ratio > 0) else img_aspect
+
+    left, top, right, bottom = clamp_crop_to_image(
+        req.left,
+        req.top,
+        req.right,
+        req.bottom,
+        angle_deg=angle,
+        aspect_w_over_h=img_aspect,
+        locked_ratio=locked_ratio,
+    )
+
+    crop = {
+        **existing,
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "angle": round(angle, 2),
+        "aspect_locked": bool(req.aspect_locked),
+        "aspect_ratio": round(locked_ratio or ((right - left) * orig_w / max(1.0, (bottom - top) * orig_h)), 4),
+        "orig_width": orig_w,
+        "orig_height": orig_h,
+        "crop_width_px": int(round((right - left) * orig_w)),
+        "crop_height_px": int(round((bottom - top) * orig_h)),
+        "min_long_px": int(existing.get("min_long_px") or DEFAULT_MIN_LONG_PX),
+        "selected_horizon_idx": req.selected_horizon_idx,
+        "horizons": existing.get("horizons") or [],
+        "source": "manual",
+        "applied": bool(req.applied),
+    }
+
+    was_applied = bool(img.get("crop_applied"))
+    xmp_synced = False
+    prev_xml: Optional[str] = None
+    settings = db.get_settings()
+    if (crop["applied"] or was_applied) and bool(settings.get("realtime_xmp_write", True)) and img.get("source_path"):
+        ok, prev_xml, _, err = write_xmp_sidecar(Path(img["source_path"]), crop=crop)
+        if ok:
+            xmp_synced = True
+        else:
+            db.add_event_log("WARNING", "xmp", f"Crop XMP write failed for {img['filename']}: {err}")
+
+    updated = db.save_image_crop(
+        image_id=image_id,
+        crop=crop,
+        orig_width=orig_w,
+        orig_height=orig_h,
+        record_change=True,
+        action_type="crop_edit",
+        xmp_synced=xmp_synced,
+        prev_xmp_xml=prev_xml,
+    )
+    return {"image": updated, "crop": updated.get("crop") if updated else None, "xmp_synced": xmp_synced}
+
+
+@app.post("/api/images/{image_id}/crop/reset")
+async def reset_image_crop(image_id: str, req: Optional[CropResetRequest] = None) -> Dict[str, Any]:
+    img = db.get_image(image_id)
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+    mode = (req.mode if req else "clear").lower()
+
+    if mode == "auto":
+        updated = await asyncio.to_thread(
+            _compute_and_save_crop,
+            img,
+            apply=False,
+            force=True,
+            record_change=True,
+            action_type="crop_reset",
+        )
+        return {"image": updated, "crop": updated.get("crop") if updated else None}
+
+    # Default "clear": reset to uncropped full frame, angle=0, applied=False, preserve detected horizons
+    existing = dict(img.get("crop") or {})
+    orig_w = int(existing.get("orig_width") or img.get("orig_width") or img.get("preview_width") or 1)
+    orig_h = int(existing.get("orig_height") or img.get("orig_height") or img.get("preview_height") or 1)
+    cleared = {
+        **existing,
+        "left": 0.0,
+        "top": 0.0,
+        "right": 1.0,
+        "bottom": 1.0,
+        "angle": 0.0,
+        "aspect_locked": True,
+        "aspect_ratio": round(orig_w / float(max(1, orig_h)), 4),
+        "orig_width": orig_w,
+        "orig_height": orig_h,
+        "crop_width_px": orig_w,
+        "crop_height_px": orig_h,
+        "selected_horizon_idx": None,
+        "horizons": existing.get("horizons") or [],
+        "source": "reset",
+        "applied": False,
+    }
+    was_applied = bool(img.get("crop_applied"))
+    xmp_synced = False
+    prev_xml: Optional[str] = None
+    settings = db.get_settings()
+    if was_applied and bool(settings.get("realtime_xmp_write", True)) and img.get("source_path"):
+        ok, prev_xml, _, _ = write_xmp_sidecar(Path(img["source_path"]), crop=cleared)
+        if ok:
+            xmp_synced = True
+
+    updated = db.save_image_crop(
+        image_id=image_id,
+        crop=cleared,
+        orig_width=orig_w,
+        orig_height=orig_h,
+        record_change=True,
+        action_type="crop_reset",
+        xmp_synced=xmp_synced,
+        prev_xmp_xml=prev_xml,
+    )
+    return {"image": updated, "crop": updated.get("crop") if updated else None, "xmp_synced": xmp_synced}
+
+
+@app.post("/api/images/batch-smart-crop")
+async def batch_smart_crop(req: BatchSmartCropRequest) -> Dict[str, Any]:
+    batch_id = f"crop_{uuid.uuid4().hex[:8]}"
+    updated_count = 0
+    xmp_synced_count = 0
+
+    def _run_batch() -> Tuple[int, int]:
+        upd = 0
+        xsync = 0
+        settings = db.get_settings()
+        realtime_xmp = bool(settings.get("realtime_xmp_write", True))
+        for iid in req.image_ids:
+            img = db.get_image(iid)
+            if not img:
+                continue
+            if req.reset:
+                existing = dict(img.get("crop") or {})
+                orig_w = int(existing.get("orig_width") or img.get("orig_width") or img.get("preview_width") or 1)
+                orig_h = int(existing.get("orig_height") or img.get("orig_height") or img.get("preview_height") or 1)
+                cleared = {
+                    **existing,
+                    "left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0, "angle": 0.0,
+                    "aspect_locked": True,
+                    "aspect_ratio": round(orig_w / float(max(1, orig_h)), 4),
+                    "orig_width": orig_w, "orig_height": orig_h,
+                    "crop_width_px": orig_w, "crop_height_px": orig_h,
+                    "selected_horizon_idx": None,
+                    "horizons": existing.get("horizons") or [],
+                    "source": "reset",
+                    "applied": False,
+                }
+                prev_xml = None
+                did_xmp = False
+                if img.get("crop_applied") and realtime_xmp and img.get("source_path"):
+                    ok, prev_xml, _, _ = write_xmp_sidecar(Path(img["source_path"]), crop=cleared)
+                    if ok:
+                        did_xmp = True
+                        xsync += 1
+                db.save_image_crop(
+                    iid, cleared, orig_width=orig_w, orig_height=orig_h,
+                    record_change=True, action_type="batch_crop_reset",
+                    xmp_synced=did_xmp, prev_xmp_xml=prev_xml, batch_id=batch_id,
+                )
+                upd += 1
+            else:
+                res = _compute_and_save_crop(
+                    img,
+                    apply=req.apply,
+                    force=req.force,
+                    min_long_px=req.min_long_px,
+                    record_change=req.apply,
+                    action_type="batch_smart_crop",
+                    batch_id=batch_id,
+                )
+                if res:
+                    upd += 1
+                    if req.apply and realtime_xmp:
+                        xsync += 1
+        return upd, xsync
+
+    updated_count, xmp_synced_count = await asyncio.to_thread(_run_batch)
+    db.add_event_log(
+        "INFO",
+        "crop",
+        f"Batch smart crop ({'reset' if req.reset else 'apply' if req.apply else 'suggest'}): {updated_count} images",
+        {"batch_id": batch_id, "xmp_synced": xmp_synced_count},
+    )
+    return {"updated": updated_count, "xmp_synced": xmp_synced_count, "batch_id": batch_id}
 
 
 # ------------------------------------------------------------------
